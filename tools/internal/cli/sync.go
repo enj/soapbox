@@ -58,6 +58,7 @@ type syncFlags struct {
 	apply       *bool
 	approve     *string
 	unattended  *bool
+	verifyWrite *bool
 }
 
 func syncFlagSet() (*flag.FlagSet, *syncFlags) {
@@ -83,6 +84,7 @@ func syncFlagSet() (*flag.FlagSet, *syncFlags) {
 		apply:       fs.Bool("apply", false, "publish the plan, which requires -approve and a reachable destination"),
 		approve:     fs.String("approve", "", "the manifest hash being approved, required by -apply"),
 		unattended:  fs.Bool("unattended", false, "run as a trusted workflow, reading "+tokenEnvName+" and self-approving"),
+		verifyWrite: fs.Bool("verify-write", false, "verify trusted GITHUB_TOKEN write access with a leased no-op branch push"),
 	}
 }
 
@@ -123,10 +125,14 @@ func runSync(ctx context.Context, env Env, args []string) error {
 		return profileError(env, paths.config, err)
 	}
 
-	// Unattended mode requires automatic publication.
-	if *flags.unattended && cfg.Publication.Mode != config.PublicationModeAutomatic {
+	// Trusted self-apply and write verification are automatic-mode operations.
+	if (*flags.unattended || *flags.verifyWrite) && cfg.Publication.Mode != config.PublicationModeAutomatic {
+		flagName := "-unattended"
+		if *flags.verifyWrite {
+			flagName = "-verify-write"
+		}
 		return &usageError{
-			err:   fmt.Errorf("-unattended requires publication.mode %q, profile has %q", config.PublicationModeAutomatic, cfg.Publication.Mode),
+			err:   fmt.Errorf("%s requires publication.mode %q, profile has %q", flagName, config.PublicationModeAutomatic, cfg.Publication.Mode),
 			usage: usage,
 		}
 	}
@@ -150,7 +156,7 @@ func runSync(ctx context.Context, env Env, args []string) error {
 	}
 	workflowApply := *flags.apply
 	workflowApproval := *flags.approve
-	if actionsCtx != nil && !*flags.unattended {
+	if actionsCtx != nil && !*flags.unattended && !*flags.verifyWrite {
 		approval, ok := os.LookupEnv(approvalEnvName)
 		if ok && approval != "" {
 			if workflowApply && workflowApproval != approval {
@@ -215,6 +221,28 @@ func runSync(ctx context.Context, env Env, args []string) error {
 	destinationGit, err := gitcli.New(ctx, destOpts)
 	if err != nil {
 		return err
+	}
+
+	if *flags.verifyWrite {
+		if actionsCtx == nil || token == "" || localDestinationGit == nil {
+			return &usageError{err: fmt.Errorf("-verify-write requires %s in a trusted workflow context", tokenEnvName), usage: usage}
+		}
+		if err := verifySyncWorkflow(ctx, token, cfg); err != nil {
+			return err
+		}
+		verified, err := sync.VerifyWriteAccess(ctx, sync.WriteVerificationOptions{
+			Config:   cfg,
+			LocalGit: localDestinationGit,
+			Destination: sync.Destination{
+				Git: destinationGit, Remote: cfg.Destination.Remote,
+				Identity: "github.com/" + cfg.Destination.Repository,
+				Lister:   publish.NewHTTPSRemote(destinationGit),
+			},
+		})
+		if err != nil {
+			return syncError(err, usage)
+		}
+		return writeReportOutput(ctx, env, "sync", paths.report, *flags.format, verified.JSON, verified.Text)
 	}
 
 	goRunner, err := generateGoRunner(ctx, paths.dir, proxy)
@@ -350,6 +378,25 @@ func checkSyncFlags(flags *syncFlags, given map[string]bool) error {
 		return errors.New("a synchronization writes its objects into a destination repository, so -destination is required")
 	}
 
+	// Write verification is a trusted, destination-only operation. It neither
+	// discovers nor applies a source release, so every publication or input
+	// override is contradictory.
+	if *flags.verifyWrite {
+		switch {
+		case *flags.unattended:
+			return errors.New("-verify-write is a no-op probe, so -unattended cannot also be given")
+		case *flags.apply:
+			return errors.New("-verify-write publishes no plan, so -apply cannot also be given")
+		case *flags.approve != "":
+			return errors.New("-verify-write publishes no plan, so -approve cannot also be given")
+		case *flags.localRemote:
+			return errors.New("-verify-write runs only in the trusted HTTPS workflow, so -local-remote cannot also be given")
+		case given["remote"] || given["identity"] || given["state-commit"] || given["tag"] || given["source-remote"] || given["patch-branch"] || given["offline"] || given["fetch"]:
+			return errors.New("-verify-write derives every input from the trusted workflow and profile, so input overrides cannot be given")
+		}
+		return nil
+	}
+
 	// Unattended mode is mutually exclusive with manual apply/approve,
 	// local-remote, remote/identity overrides, state-commit, tag, and
 	// source-remote. These are contradictions in intent: unattended self-
@@ -434,7 +481,7 @@ func validateWorkflowApproval(approval string) error {
 }
 
 func syncToken(flags *syncFlags, cfg *config.Config, usage func(io.Writer), lookup actionsctx.LookupEnv) (string, *actionsctx.Context, error) {
-	if *flags.unattended {
+	if *flags.unattended || *flags.verifyWrite {
 		// Validate the Actions context before reading the token.
 		actionsCtx, err := actionsctx.Validate(actionsctx.Options{
 			LookupEnv:     lookup,
@@ -447,8 +494,12 @@ func syncToken(flags *syncFlags, cfg *config.Config, usage func(io.Writer), look
 
 		token, ok := lookup(tokenEnvName)
 		if !ok || token == "" {
+			flagName := "-unattended"
+			if *flags.verifyWrite {
+				flagName = "-verify-write"
+			}
 			return "", nil, &usageError{
-				err:   fmt.Errorf("-unattended requires %s to be set", tokenEnvName),
+				err:   fmt.Errorf("%s requires %s to be set", flagName, tokenEnvName),
 				usage: usage,
 			}
 		}

@@ -346,26 +346,45 @@ func consumerChunkBase(opts ChunkOptions) (chunkPosition, error) {
 			break
 		}
 	}
+
 	position := chunkPosition{}
-	if published != nil {
+	cursorDestination := ""
+	switch {
+	case opts.Discovery.ControlPlaneBranch != nil:
+		control := opts.Discovery.ControlPlaneBranch
+		if published == nil {
+			return chunkPosition{}, fmt.Errorf("replay chunk: control-plane branch %s has no generated state base", branchRef)
+		}
+		if control.Ref != branchRef || control.Base != published.Object || control.Source != published.Source {
+			return chunkPosition{}, fmt.Errorf(
+				"replay chunk: control-plane branch %#v does not match state branch %#v",
+				*control, *published)
+		}
+		position.source, position.destination = published.Source, control.Object
+		cursorDestination = published.Object
+	case published != nil:
 		position.source, position.destination = published.Source, published.Object
-	} else if opts.Discovery.AdoptedBranch != nil {
+		cursorDestination = published.Object
+	case opts.Discovery.AdoptedBranch != nil:
 		position.source = opts.Discovery.AdoptedBranch.Source
 		position.destination = opts.Discovery.AdoptedBranch.Object
-	} else {
+		cursorDestination = opts.Discovery.AdoptedBranch.Object
+	default:
 		return chunkPosition{}, fmt.Errorf("replay chunk: state records no verified consumer branch %s", branchRef)
 	}
 	if observed := opts.Discovery.Observed[branchRef]; observed != position.destination {
 		return chunkPosition{}, fmt.Errorf("replay chunk: consumer branch %s is %s, expected %s", branchRef, observed, position.destination)
 	}
 	for _, cursor := range opts.Discovery.State.Cursors {
-		if cursor.Source == position.source && cursor.Destination == position.destination && strings.HasPrefix(cursor.Ref, "refs/tags/") {
+		if cursor.Source == position.source && cursor.Destination == cursorDestination && strings.HasPrefix(cursor.Ref, "refs/tags/") {
 			position.tag = strings.TrimPrefix(cursor.Ref, "refs/tags/")
 			break
 		}
 	}
 	if position.tag == "" {
-		return chunkPosition{}, fmt.Errorf("replay chunk: consumer position %s at %s has no source release cursor", position.source, position.destination)
+		return chunkPosition{}, fmt.Errorf(
+			"replay chunk: consumer position %s at generated base %s has no source release cursor",
+			position.source, cursorDestination)
 	}
 	return position, nil
 }

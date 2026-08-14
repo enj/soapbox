@@ -257,7 +257,14 @@ on:
         type: string
 `)
 	} else {
-		b.WriteString("  workflow_dispatch:\n")
+		b.WriteString(`  workflow_dispatch:
+    inputs:
+      verify-write:
+        description: Verify GITHUB_TOKEN write access without processing releases
+        required: false
+        default: false
+        type: boolean
+`)
 	}
 	b.WriteString(`
 permissions: {}
@@ -301,22 +308,40 @@ jobs:
 	b.WriteString(`
         run: `)
 	b.WriteString(SyncBuildCommand)
-	b.WriteString(`
+	if in.mode == "manual" {
+		b.WriteString(`
       - name: Synchronize with upstream
         working-directory: `)
-	b.WriteString(toolsDirName)
-	b.WriteString(`
+		b.WriteString(toolsDirName)
+		b.WriteString(`
         env:
           SOAPBOX_GITHUB_TOKEN: ${{ github.token }}
-`)
-	if in.mode == "manual" {
-		b.WriteString("          SOAPBOX_APPROVAL: ${{ inputs.approve }}\n")
+          SOAPBOX_APPROVAL: ${{ inputs.approve }}
+        run: `)
+		b.WriteString(syncRunCommand)
+		b.WriteString("\n")
+	} else {
+		b.WriteString(`
+      - name: Verify write access
+        if: inputs.verify-write
+        working-directory: `)
+		b.WriteString(toolsDirName)
+		b.WriteString(`
+        env:
+          SOAPBOX_GITHUB_TOKEN: ${{ github.token }}
+        run: `)
+		b.WriteString(syncRunCommand)
+		b.WriteString(` -verify-write
+      - name: Synchronize with upstream
+        if: ${{ !inputs.verify-write }}
+        working-directory: `)
+		b.WriteString(toolsDirName)
+		b.WriteString(`
+        env:
+          SOAPBOX_GITHUB_TOKEN: ${{ github.token }}
+        run: `)
+		b.WriteString(syncRunCommand)
+		b.WriteString(" -unattended\n")
 	}
-	b.WriteString(`        run: `)
-	b.WriteString(syncRunCommand)
-	if in.mode == "automatic" {
-		b.WriteString(" -unattended")
-	}
-	b.WriteString("\n")
 	return []byte(b.String())
 }

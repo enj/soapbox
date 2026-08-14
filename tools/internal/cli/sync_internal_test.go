@@ -100,6 +100,17 @@ func TestSyncTokenUnattendedRequiresToken(t *testing.T) {
 	}
 }
 
+func TestSyncTokenVerifyWriteRequiresToken(t *testing.T) {
+	env := validActionsEnv(validSHA)
+	fs, flags := syncFlagSet()
+	_ = fs.Parse([]string{"-verify-write"})
+	usage := func(io.Writer) {}
+	_, _, err := syncToken(flags, testProfileConfig(), usage, mapLookup(env))
+	if err == nil || !strings.Contains(err.Error(), "-verify-write requires "+tokenEnvName) {
+		t.Fatalf("verify-write token error = %v", err)
+	}
+}
+
 // TestSyncTokenReturnsNilWithoutToken verifies the no-credential path.
 func TestSyncTokenReturnsNilWithoutToken(t *testing.T) {
 	fs, flags := syncFlagSet()

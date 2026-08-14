@@ -307,32 +307,16 @@ func Reconcile(ctx context.Context, opts ReconcileOptions) (*ReconcileResult, er
 // job-scoped credential still has write access before an external credential is
 // decommissioned or a later release needs a real push.
 func verifyFixedPointWrite(ctx context.Context, opts ReconcileOptions, discovery *Discovery) error {
-	ref := "refs/heads/" + opts.Config.Destination.Branch
-	object := discovery.Observed[ref]
-	if object == "" {
-		return fmt.Errorf("reconciliation: fixed-point write verification: %s was not observed", ref)
-	}
-	publisher, _, err := publisherForDestination(ctx, opts.Destination.Git, opts.Destination, opts.Config, discovery.Format)
-	if err != nil {
-		return fmt.Errorf("reconciliation: fixed-point write verification: %w", err)
-	}
-	plan, err := publisher.Plan(ctx, []publish.Update{{
-		Ref: ref, Kind: publish.KindBranch,
-		NewObject: object, ExpectedOld: object,
-		Evidence: "automatic fixed-point write verification",
-	}})
-	if err != nil {
-		return fmt.Errorf("reconciliation: fixed-point write verification: %w", err)
-	}
-	result, err := publisher.Apply(ctx, plan, publish.ApplyOptions{
-		Approval: plan.Manifest.Hash,
-		Scope:    publish.ScopeReconcile,
+	result, err := VerifyWriteAccess(ctx, WriteVerificationOptions{
+		Config: opts.Config, LocalGit: opts.LocalGit, Destination: opts.Destination,
 	})
 	if err != nil {
 		return fmt.Errorf("reconciliation: fixed-point write verification: %w", err)
 	}
-	if !result.Verified || len(result.Pushed) != 1 || result.Pushed[0] != ref {
-		return fmt.Errorf("reconciliation: fixed-point write verification: push result verified=%t refs=%v", result.Verified, result.Pushed)
+	if observed := discovery.Observed[result.Ref]; observed != result.Object {
+		return fmt.Errorf(
+			"reconciliation: fixed-point write verification observed %s at %s, verification used %s",
+			result.Ref, observed, result.Object)
 	}
 	return nil
 }

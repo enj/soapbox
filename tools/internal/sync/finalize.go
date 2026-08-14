@@ -224,7 +224,9 @@ func ApplyTrusted(ctx context.Context, result *Result) (*TrustedApplyResult, err
 		Config: result.trusted.config, SourceCache: result.trusted.sourceCache,
 		Destination: result.trusted.destination, Release: result.trusted.release,
 		Document: result.Document, State: result.State, Observed: observed,
-		BranchObject: result.Manifest.Objects.Commit, TagObject: result.Manifest.Objects.Tag,
+		ObservedBranchObject:  result.Manifest.Objects.Commit,
+		GeneratedBranchObject: result.Manifest.Objects.Commit,
+		TagObject:             result.Manifest.Objects.Tag,
 	})
 	if err != nil {
 		return applied, fmt.Errorf("trusted finalize apply: %w", err)
@@ -260,11 +262,19 @@ func PlanAdoptionReconciliation(ctx context.Context, opts FinalizeOptions) (*Rec
 		return nil, errors.New("adoption reconciliation: an adopted consumer tag is required")
 	}
 	branchRef := "refs/heads/" + opts.Config.Destination.Branch
-	branchObject := opts.Discovery.Observed[branchRef]
-	if opts.Discovery.AdoptedBranch != nil {
-		branchObject = opts.Discovery.AdoptedBranch.Object
+	observedBranch := opts.Discovery.Observed[branchRef]
+	generatedBranch := observedBranch
+	switch {
+	case opts.Discovery.ControlPlaneBranch != nil:
+		control := opts.Discovery.ControlPlaneBranch
+		if control.Ref != branchRef || control.Object != observedBranch {
+			return nil, errors.New("adoption reconciliation: control-plane branch does not match the observed consumer branch")
+		}
+		generatedBranch = control.Base
+	case opts.Discovery.AdoptedBranch != nil:
+		generatedBranch = opts.Discovery.AdoptedBranch.Object
 	}
-	if branchObject == "" {
+	if observedBranch == "" || generatedBranch == "" {
 		return nil, errors.New("adoption reconciliation: the consumer branch is absent")
 	}
 	stored, err := state.Inspect(ctx, opts.Destination.Git, opts.Discovery.StateCommit)
@@ -274,10 +284,11 @@ func PlanAdoptionReconciliation(ctx context.Context, opts FinalizeOptions) (*Rec
 	return planObservedReconciliation(ctx, reconciliationOptions{
 		Config: opts.Config, SourceCache: opts.SourceCache, Destination: opts.Destination,
 		Release: opts.Release, Document: opts.Discovery.State, State: stored,
-		Observed:     opts.Discovery.Observed,
-		BranchObject: branchObject,
-		TagObject:    opts.Discovery.Adopted.Object,
-		AllowLegacy:  true,
+		Observed:              opts.Discovery.Observed,
+		ObservedBranchObject:  observedBranch,
+		GeneratedBranchObject: generatedBranch,
+		TagObject:             opts.Discovery.Adopted.Object,
+		AllowLegacy:           true,
 	})
 }
 
@@ -297,34 +308,35 @@ func ApplyReconciliation(ctx context.Context, result *ReconciliationResult, appr
 }
 
 type reconciliationOptions struct {
-	Config       *config.Config
-	SourceCache  *source.Cache
-	Destination  Destination
-	Release      source.Release
-	Document     state.Document
-	State        state.Record
-	Observed     map[string]string
-	BranchObject string
-	TagObject    string
-	AllowLegacy  bool
+	Config                *config.Config
+	SourceCache           *source.Cache
+	Destination           Destination
+	Release               source.Release
+	Document              state.Document
+	State                 state.Record
+	Observed              map[string]string
+	ObservedBranchObject  string
+	GeneratedBranchObject string
+	TagObject             string
+	AllowLegacy           bool
 }
 
 func planObservedReconciliation(ctx context.Context, opts reconciliationOptions) (*ReconciliationResult, error) {
 	branchRef := "refs/heads/" + opts.Config.Destination.Branch
 	tagRef := "refs/tags/" + opts.Release.DestinationTag
-	if opts.Observed[branchRef] != opts.BranchObject || opts.Observed[tagRef] != opts.TagObject {
+	if opts.Observed[branchRef] != opts.ObservedBranchObject || opts.Observed[tagRef] != opts.TagObject {
 		return nil, errors.New("reconciliation: observed consumer refs do not match the proposed state")
 	}
 	track := completedTrackForRelease(opts.Document, opts.Release)
 	if track != nil {
-		if track.Destination != opts.BranchObject {
+		if track.Destination != opts.GeneratedBranchObject {
 			return nil, errors.New("reconciliation: completed track does not prove the observed consumer branch")
 		}
 		if opts.Observed[track.Ref] != track.Destination {
 			return nil, errors.New("reconciliation: observed progress ref does not match the completed track")
 		}
 	} else {
-		if !opts.AllowLegacy || !legacyBranchProvesRelease(opts.Document, branchRef, opts.Release, opts.BranchObject) {
+		if !opts.AllowLegacy || !legacyBranchProvesRelease(opts.Document, branchRef, opts.Release, opts.GeneratedBranchObject) {
 			return nil, errors.New("reconciliation: no completed track or legacy state proves the observed consumer branch")
 		}
 	}
@@ -332,7 +344,7 @@ func planObservedReconciliation(ctx context.Context, opts reconciliationOptions)
 	next := opts.Document.Clone()
 	next.Digest = ""
 	cursorRef := opts.Release.Source.Ref
-	cursor := state.Cursor{Ref: cursorRef, Source: opts.Release.Source.Commit, Destination: opts.BranchObject}
+	cursor := state.Cursor{Ref: cursorRef, Source: opts.Release.Source.Commit, Destination: opts.GeneratedBranchObject}
 	cursorUpdated := false
 	for i := range next.Cursors {
 		if next.Cursors[i].Ref == cursorRef {
@@ -351,7 +363,7 @@ func planObservedReconciliation(ctx context.Context, opts reconciliationOptions)
 		case branchRef:
 			published = append(published, state.Published{
 				Ref: branchRef, Kind: state.KindBranch,
-				Object: opts.BranchObject, Source: opts.Release.Source.Commit,
+				Object: opts.GeneratedBranchObject, Source: opts.Release.Source.Commit,
 			})
 			branchUpdated = true
 		case tagRef:
@@ -365,7 +377,7 @@ func planObservedReconciliation(ctx context.Context, opts reconciliationOptions)
 		}
 	}
 	if !branchUpdated {
-		published = append(published, state.Published{Ref: branchRef, Kind: state.KindBranch, Object: opts.BranchObject, Source: opts.Release.Source.Commit})
+		published = append(published, state.Published{Ref: branchRef, Kind: state.KindBranch, Object: opts.GeneratedBranchObject, Source: opts.Release.Source.Commit})
 	}
 	if !tagUpdated {
 		published = append(published, state.Published{Ref: tagRef, Kind: state.KindTag, Object: opts.TagObject, Source: opts.Release.Source.Commit})
@@ -413,7 +425,7 @@ func planObservedReconciliation(ctx context.Context, opts reconciliationOptions)
 		},
 		{
 			Ref: branchRef, Kind: publish.KindBranch,
-			NewObject: opts.BranchObject, ExpectedOld: opts.BranchObject,
+			NewObject: opts.ObservedBranchObject, ExpectedOld: opts.ObservedBranchObject,
 			Evidence: "observe:branch:" + opts.Release.DestinationTag,
 		},
 		{

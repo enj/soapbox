@@ -85,6 +85,20 @@ type AdoptedBranch struct {
 	Source string
 }
 
+// ControlPlaneBranch is a verified fast-forward of the consumer branch that
+// changes only operator-owned paths. State continues to name Base as the image
+// of Source; Object is the graft point a future replay must preserve.
+type ControlPlaneBranch struct {
+	// Ref is the fully qualified branch ref.
+	Ref string
+	// Base is the generated commit state last observed.
+	Base string
+	// Object is the current control-plane branch head.
+	Object string
+	// Source is the source commit Base was generated from.
+	Source string
+}
+
 // ResolvedAnchor records an anchor that was absent from the profile but proved
 // from state and the source cache.
 type ResolvedAnchor struct {
@@ -120,6 +134,10 @@ type Discovery struct {
 	// configured branch and the branch was verified against cursors. The caller
 	// must record it in the outward manifest.
 	AdoptedBranch *AdoptedBranch
+	// ControlPlaneBranch is a verified operator-only fast-forward layered over
+	// the generated commit state records. It does not need state reconciliation:
+	// no source image or consumer tag changed.
+	ControlPlaneBranch *ControlPlaneBranch
 	// ResolvedAnchor records an anchor that was absent from the profile but
 	// proved from state and the source cache. Non-nil only when the profile's
 	// anchorCommit was empty and state provided a provable anchor.
@@ -271,10 +289,18 @@ func Discover(ctx context.Context, opts DiscoverOptions) (*Discovery, error) {
 
 	// Verify the destination main branch against state and the anonymous HEAD.
 	branchRef := "refs/heads/" + opts.Config.Destination.Branch
-	adoptedBranch, err := verifyDestinationBranch(ctx, opts.LocalGit, observed, branchRef, stateDoc, opts.Config)
+	branch, err := verifyDestinationBranch(ctx, opts.LocalGit, observed, branchRef, stateDoc, opts.Config)
 	if err != nil {
 		return nil, err
 	}
+
+	// Legacy state created before common-anchor setup used the first release
+	// itself as its immutable anchor. Such an anchor proves only that release's
+	// minor line: a later minor may have branched before a patch release and is
+	// deliberately left for a separately approved profile/repository transition.
+	legacyMinorAnchor := stateDoc.Schema != 0 &&
+		stateDoc.Anchor.Ref == "refs/tags/"+minimumRelease &&
+		stateDoc.Anchor.Source == anchorCommit
 
 	// Discover upstream releases.
 	releases, err := opts.SourceCache.DiscoverReleases(ctx, source.ReleaseOptions{
@@ -282,6 +308,7 @@ func Discover(ctx context.Context, opts DiscoverOptions) (*Discovery, error) {
 		IncludePrereleases: opts.Config.Source.Refs.IncludePrereleases,
 		Policy:             opts.Config.Release.Policy,
 		Anchor:             anchorCommit,
+		SameMinor:          legacyMinorAnchor,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("discovery: %w", err)
@@ -294,14 +321,15 @@ func Discover(ctx context.Context, opts DiscoverOptions) (*Discovery, error) {
 	}
 
 	return &Discovery{
-		Format:         format,
-		Observed:       observed,
-		StateCommit:    stateCommit,
-		State:          stateDoc,
-		Pending:        pending,
-		Adopted:        adopted,
-		AdoptedBranch:  adoptedBranch,
-		ResolvedAnchor: resolvedAnchor,
+		Format:             format,
+		Observed:           observed,
+		StateCommit:        stateCommit,
+		State:              stateDoc,
+		Pending:            pending,
+		Adopted:            adopted,
+		AdoptedBranch:      branch.adopted,
+		ControlPlaneBranch: branch.controlPlane,
+		ResolvedAnchor:     resolvedAnchor,
 	}, nil
 }
 
@@ -510,26 +538,35 @@ func assertSameRepository(ctx context.Context, local, remote *gitcli.Runner) err
 	return nil
 }
 
+type branchVerification struct {
+	adopted      *AdoptedBranch
+	controlPlane *ControlPlaneBranch
+}
+
 // verifyDestinationBranch checks the destination's main branch is consistent.
 //
 // Whenever the remote has the branch, the local HEAD is required to match it.
 // This is checked first, before state logic, because a checkout that drifted
 // from the remote is wrong regardless of what state says.
 //
-// When state has a Published branch entry, the remote must also match that
-// recorded object. When state exists but has no Published branch (legacy first
-// state), the branch is verified against state cursors: exactly one cursor for
-// the configured source ref must exist, its Destination must equal the remote
-// branch, and its Source must equal the state anchor source (the minimum release
-// commit). The verified branch is returned as an AdoptedBranch.
-func verifyDestinationBranch(ctx context.Context, localGit *gitcli.Runner, observed map[string]string, branchRef string, stateDoc state.Document, cfg *config.Config) (*AdoptedBranch, error) {
+// When state has a Published branch entry, the remote must match that generated
+// object or be a verified linear fast-forward that changes only operator-owned
+// paths and carries no source-provenance trailers. The latter is retained as a
+// control-plane graft without claiming that the source commit mapped to it.
+//
+// When state exists but has no Published branch (legacy first state), the branch
+// is verified against state cursors: exactly one cursor for the configured source
+// ref must exist, its Destination must equal the remote branch, and its Source
+// must equal the state anchor source (the minimum release commit). The verified
+// branch is returned as an AdoptedBranch.
+func verifyDestinationBranch(ctx context.Context, localGit *gitcli.Runner, observed map[string]string, branchRef string, stateDoc state.Document, cfg *config.Config) (branchVerification, error) {
 	remoteBranch, hasBranch := observed[branchRef]
 	hasState := stateDoc.Schema != 0
 
 	// Whenever the remote has the branch, local HEAD must exist and match.
 	if hasBranch {
 		if err := requireLocalHEADMatches(ctx, localGit, branchRef, remoteBranch); err != nil {
-			return nil, err
+			return branchVerification{}, err
 		}
 	}
 
@@ -544,25 +581,32 @@ func verifyDestinationBranch(ctx context.Context, localGit *gitcli.Runner, obser
 		}
 
 		if publishedBranch != nil {
-			// State records the branch. Remote must match.
 			if !hasBranch {
-				return nil, fmt.Errorf(
+				return branchVerification{}, fmt.Errorf(
 					"discovery: state records %s at %s but the destination does not have it",
 					branchRef, publishedBranch.Object)
 			}
-			if publishedBranch.Object != remoteBranch {
-				track, err := completedTrackAt(stateDoc, remoteBranch)
-				if err != nil {
-					return nil, err
-				}
-				if track == nil {
-					return nil, fmt.Errorf(
-						"discovery: the destination's %s is %s but the state record says it should be %s",
-						branchRef, remoteBranch, publishedBranch.Object)
-				}
-				return &AdoptedBranch{Ref: branchRef, Object: remoteBranch, Source: track.Source}, nil
+			if publishedBranch.Object == remoteBranch {
+				return branchVerification{}, nil
 			}
-			return nil, nil
+
+			// A completed replay track is a crashed consumer publication and still
+			// requires the tag-and-branch adoption reconciliation.
+			track, err := completedTrackAt(stateDoc, remoteBranch)
+			if err != nil {
+				return branchVerification{}, err
+			}
+			if track != nil {
+				return branchVerification{adopted: &AdoptedBranch{
+					Ref: branchRef, Object: remoteBranch, Source: track.Source,
+				}}, nil
+			}
+
+			controlPlane, err := verifyControlPlaneBranch(ctx, localGit, cfg, branchRef, *publishedBranch, remoteBranch)
+			if err != nil {
+				return branchVerification{}, err
+			}
+			return branchVerification{controlPlane: controlPlane}, nil
 		}
 
 		// State exists but does not record the branch (legacy). Verify via
@@ -578,34 +622,97 @@ func verifyDestinationBranch(ctx context.Context, localGit *gitcli.Runner, obser
 			}
 		}
 		if matchingCursor == nil {
-			return nil, fmt.Errorf(
+			return branchVerification{}, fmt.Errorf(
 				"discovery: state has no Published entry for %s and no cursor for %s",
 				branchRef, sourceRef)
 		}
 		if !hasBranch {
-			return nil, fmt.Errorf(
+			return branchVerification{}, fmt.Errorf(
 				"discovery: state cursor for %s records destination %s but the remote has no %s",
 				sourceRef, matchingCursor.Destination, branchRef)
 		}
 		if matchingCursor.Destination != remoteBranch {
-			return nil, fmt.Errorf(
+			return branchVerification{}, fmt.Errorf(
 				"discovery: state cursor for %s records destination %s but remote %s is at %s",
 				sourceRef, matchingCursor.Destination, branchRef, remoteBranch)
 		}
 		// The cursor's source must be the anchor source (minimum release commit).
 		if matchingCursor.Source != stateDoc.Anchor.Source {
-			return nil, fmt.Errorf(
+			return branchVerification{}, fmt.Errorf(
 				"discovery: state cursor for %s has source %s, want the anchor source %s",
 				sourceRef, matchingCursor.Source, stateDoc.Anchor.Source)
 		}
-		return &AdoptedBranch{
+		return branchVerification{adopted: &AdoptedBranch{
 			Ref:    branchRef,
 			Object: remoteBranch,
 			Source: matchingCursor.Source,
-		}, nil
+		}}, nil
 	}
 
-	return nil, nil
+	return branchVerification{}, nil
+}
+
+// verifyControlPlaneBranch proves that a branch advance layered operator-owned
+// commits over the generated commit state records, without changing any
+// generated path or introducing source-provenance commits into destination
+// history. The advance is retained as a graft point rather than written into
+// state as another image of the same source commit.
+func verifyControlPlaneBranch(ctx context.Context, git *gitcli.Runner, cfg *config.Config, branchRef string, published state.Published, remoteBranch string) (*ControlPlaneBranch, error) {
+	descends, err := git.IsAncestor(ctx, published.Object, remoteBranch)
+	if err != nil {
+		return nil, fmt.Errorf("discovery: verify control-plane branch ancestry: %w", err)
+	}
+	if !descends {
+		return nil, fmt.Errorf(
+			"discovery: the destination's %s is %s, which does not descend from state object %s",
+			branchRef, remoteBranch, published.Object)
+	}
+
+	commits, err := git.CommitLog(ctx, gitcli.CommitLogOptions{
+		Include: []string{remoteBranch}, Exclude: []string{published.Object},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("discovery: read control-plane branch advance: %w", err)
+	}
+	if len(commits) == 0 {
+		return nil, errors.New("discovery: control-plane branch advance contains no commits")
+	}
+	for _, commit := range commits {
+		if len(commit.Parents) != 1 {
+			return nil, fmt.Errorf(
+				"discovery: control-plane commit %s has %d parents, want a linear fast-forward",
+				commit.SHA, len(commit.Parents))
+		}
+		for _, trailer := range commit.Trailers {
+			if strings.EqualFold(trailer.Key, cfg.Commit.TrailerKey) {
+				return nil, fmt.Errorf(
+					"discovery: control-plane commit %s carries source-provenance trailer %s",
+					commit.SHA, trailer.Key)
+			}
+		}
+		changed, err := git.ChangedPaths(ctx, commit.Parents[0], commit.SHA)
+		if err != nil {
+			return nil, fmt.Errorf("discovery: inspect control-plane commit %s: %w", commit.SHA, err)
+		}
+		for _, path := range changed {
+			if generatedOwnedPath(cfg, path) {
+				return nil, fmt.Errorf(
+					"discovery: control-plane commit %s changes generated path %s",
+					commit.SHA, path)
+			}
+		}
+	}
+
+	files, err := git.ListTree(ctx, remoteBranch)
+	if err != nil {
+		return nil, fmt.Errorf("discovery: read control-plane branch tree: %w", err)
+	}
+	if err := checkControlPlane(files); err != nil {
+		return nil, fmt.Errorf("discovery: %w", err)
+	}
+	return &ControlPlaneBranch{
+		Ref: branchRef, Base: published.Object, Object: remoteBranch, Source: published.Source,
+	}, nil
 }
 
 // requireLocalHEADMatches requires that the local HEAD exists and matches the
@@ -884,12 +991,25 @@ func adoptLegacyTag(ctx context.Context, opts DiscoverOptions, rel source.Releas
 			tagRef, tagObj.TargetType)
 	}
 
-	if tagObj.Tagger.Name != opts.Config.Commit.Committer.Name ||
-		tagObj.Tagger.Email != opts.Config.Commit.Committer.Email {
+	// Read the target commit before validating the tagger. A profile migration
+	// may intentionally change the configured committer; an existing tag remains
+	// adoptable only when its tagger matches either the current configuration or
+	// the actual committer of the immutable target commit.
+	tagCommit := tagObj.TargetOID
+	commit, err := opts.LocalGit.CommitInfo(ctx, tagCommit)
+	if err != nil {
+		return nil, fmt.Errorf("discovery: adopt legacy tag %s: read commit: %w", tagRef, err)
+	}
+	matchesConfigured := tagObj.Tagger.Name == opts.Config.Commit.Committer.Name &&
+		tagObj.Tagger.Email == opts.Config.Commit.Committer.Email
+	matchesTarget := tagObj.Tagger.Name == commit.CommitterName &&
+		tagObj.Tagger.Email == commit.CommitterEmail
+	if !matchesConfigured && !matchesTarget {
 		return nil, fmt.Errorf(
-			"discovery: adopt legacy tag %s: tagger %q <%s> does not match configured committer %q <%s>",
+			"discovery: adopt legacy tag %s: tagger %q <%s> matches neither configured committer %q <%s> nor target committer %q <%s>",
 			tagRef, tagObj.Tagger.Name, tagObj.Tagger.Email,
-			opts.Config.Commit.Committer.Name, opts.Config.Commit.Committer.Email)
+			opts.Config.Commit.Committer.Name, opts.Config.Commit.Committer.Email,
+			commit.CommitterName, commit.CommitterEmail)
 	}
 
 	// Verify the tag message is exactly the expected release format.
@@ -907,9 +1027,8 @@ func adoptLegacyTag(ctx context.Context, opts DiscoverOptions, rel source.Releas
 			tagRef, tagObj.Message, expectedMessage)
 	}
 
-	// Peel to the commit and verify consistency with state. Legacy adoption is
-	// permitted only when an existing state record anchors the destination branch.
-	tagCommit := tagObj.TargetOID
+	// Verify consistency with state. Legacy adoption is permitted only when an
+	// existing state record anchors the destination branch.
 	if stateDoc.Schema == 0 {
 		return nil, fmt.Errorf("discovery: adopt legacy tag %s: no state record anchors the destination", tagRef)
 	}
@@ -946,10 +1065,6 @@ func adoptLegacyTag(ctx context.Context, opts DiscoverOptions, rel source.Releas
 	}
 
 	// Verify the provenance trailer on the commit.
-	commit, err := opts.LocalGit.CommitInfo(ctx, tagCommit)
-	if err != nil {
-		return nil, fmt.Errorf("discovery: adopt legacy tag %s: read commit: %w", tagRef, err)
-	}
 	trailerKey := opts.Config.Commit.TrailerKey
 	if trailerKey == "" {
 		return nil, fmt.Errorf("discovery: adopt legacy tag %s: no provenance trailer key configured", tagRef)

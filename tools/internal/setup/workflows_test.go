@@ -54,6 +54,7 @@ type workflowJob struct {
 
 type workflowStep struct {
 	Name             string            `yaml:"name"`
+	If               string            `yaml:"if"`
 	Uses             string            `yaml:"uses"`
 	Run              string            `yaml:"run"`
 	With             map[string]any    `yaml:"with"`
@@ -150,8 +151,17 @@ func TestGeneratedWorkflowsAreLeastPrivilege(t *testing.T) {
 	})
 
 	t.Run("sync runs unattended and only from the protected default branch", func(t *testing.T) {
-		if _, ok := sync.On["workflow_dispatch"]; !ok {
-			t.Error("sync cannot be dispatched manually")
+		dispatch, ok := sync.On["workflow_dispatch"].(map[string]any)
+		if !ok {
+			t.Fatalf("sync workflow_dispatch = %#v, want input mapping", sync.On["workflow_dispatch"])
+		}
+		inputs, ok := dispatch["inputs"].(map[string]any)
+		if !ok {
+			t.Fatalf("sync dispatch inputs = %#v", dispatch["inputs"])
+		}
+		verify, ok := inputs["verify-write"].(map[string]any)
+		if !ok || verify["type"] != "boolean" || verify["required"] != false || verify["default"] != false {
+			t.Fatalf("verify-write input = %#v, want optional false boolean", inputs["verify-write"])
 		}
 		if _, ok := sync.On["pull_request"]; ok {
 			t.Error("sync runs on pull requests")
@@ -226,60 +236,54 @@ func TestGeneratedWorkflowsAreLeastPrivilege(t *testing.T) {
 		}
 	})
 
-	t.Run("sync exports the GITHUB_TOKEN", func(t *testing.T) {
-		var exported map[string]string
+	t.Run("sync exports the GITHUB_TOKEN only to execution steps", func(t *testing.T) {
+		var exported []map[string]string
 		for _, step := range sync.Jobs["sync"].Steps {
 			if len(step.Env) > 0 {
-				if exported != nil {
-					t.Fatal("more than one sync step exports environment variables")
-				}
-				exported = step.Env
+				exported = append(exported, step.Env)
 			}
 		}
-		want := map[string]string{
-			"SOAPBOX_GITHUB_TOKEN": "${{ github.token }}",
+		if len(exported) != 2 {
+			t.Fatalf("%d sync steps export environment variables, want verification and synchronization", len(exported))
 		}
-		if len(exported) != len(want) {
-			t.Fatalf("sync exports %v, want %v", exported, want)
-		}
-		for name, value := range want {
-			if exported[name] != value {
-				t.Errorf("sync exports %s = %q, want %q", name, exported[name], value)
+		want := map[string]string{"SOAPBOX_GITHUB_TOKEN": "${{ github.token }}"}
+		for i, env := range exported {
+			if len(env) != len(want) || env["SOAPBOX_GITHUB_TOKEN"] != want["SOAPBOX_GITHUB_TOKEN"] {
+				t.Errorf("execution step %d exports %v, want %v", i, env, want)
 			}
 		}
 	})
 
-	t.Run("sync builds without token and runs with token", func(t *testing.T) {
+	t.Run("sync builds without token and selects one token execution", func(t *testing.T) {
 		var commands []string
-		var tokenSteps []string
+		var tokenSteps []workflowStep
 		for _, step := range sync.Jobs["sync"].Steps {
 			if step.Run != "" {
 				commands = append(commands, step.Run)
 				if len(step.Env) > 0 {
-					tokenSteps = append(tokenSteps, step.Run)
+					tokenSteps = append(tokenSteps, step)
 				}
 			}
 		}
-		if len(commands) != 2 {
-			t.Fatalf("sync runs %d commands, want exactly two (build + run): %q", len(commands), commands)
+		if len(commands) != 3 {
+			t.Fatalf("sync runs %d commands, want build + write verification + synchronization: %q", len(commands), commands)
 		}
-		// First command builds without token.
 		if !strings.HasPrefix(commands[0], "go build ") {
 			t.Errorf("first command = %q, want go build", commands[0])
 		}
-		// Second command runs the pre-built binary with -unattended (automatic mode).
-		if !strings.Contains(commands[1], "-unattended") {
-			t.Error("the automatic mode sync workflow does not pass -unattended")
+		if len(tokenSteps) != 2 {
+			t.Fatalf("expected verification and synchronization token steps, got %d", len(tokenSteps))
 		}
-		if strings.Contains(commands[1], "-apply") {
-			t.Error("the generated sync workflow publishes without an approval")
+		if !strings.Contains(commands[1], "-verify-write") || tokenSteps[0].If != "inputs.verify-write" {
+			t.Errorf("write verification step = %#v", tokenSteps[0])
 		}
-		// Only the run step receives the token.
-		if len(tokenSteps) != 1 {
-			t.Fatalf("expected exactly one step with SOAPBOX_GITHUB_TOKEN, got %d", len(tokenSteps))
+		if !strings.Contains(commands[2], "-unattended") || tokenSteps[1].If != "${{ !inputs.verify-write }}" {
+			t.Errorf("automatic synchronization step = %#v", tokenSteps[1])
 		}
-		if strings.HasPrefix(tokenSteps[0], "go build") {
-			t.Error("the build step should not receive the token")
+		for _, step := range tokenSteps {
+			if strings.HasPrefix(step.Run, "go build") {
+				t.Error("the build step should not receive the token")
+			}
 		}
 		for _, cmd := range commands {
 			if strings.ContainsAny(cmd, "|&;<>()") {

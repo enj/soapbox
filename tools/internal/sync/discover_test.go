@@ -127,9 +127,12 @@ func (d *discoveryDest) publishedState(ctx context.Context, t *testing.T, source
 	t.Helper()
 
 	blob, _ := d.localGit.WriteBlob(ctx, []byte("published\n"))
-	tree, _ := d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
-		{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"},
-	})
+	entries, listErr := d.localGit.ListTree(ctx, d.parent)
+	if listErr != nil {
+		t.Fatalf("read control-plane tree: %v", listErr)
+	}
+	entries = append(entries, gitcli.TreeEntry{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"})
+	tree, _ := d.localGit.WriteTree(ctx, entries)
 	dc, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Parents: []string{d.parent},
 		Author: testSignature, Committer: testSignature,
@@ -178,6 +181,49 @@ func (d *discoveryDest) publishedState(ctx context.Context, t *testing.T, source
 	})
 	d.localGit.UpdateRef(ctx, testBranchRef, dc, d.parent)
 	return record.Commit, dc, tOID
+}
+
+func (d *discoveryDest) advanceBranch(ctx context.Context, t *testing.T, base, path, contents, message string) string {
+	t.Helper()
+	entries, err := d.localGit.ListTree(ctx, base)
+	if err != nil {
+		t.Fatalf("read branch base tree: %v", err)
+	}
+	object, err := d.localGit.WriteBlob(ctx, []byte(contents))
+	if err != nil {
+		t.Fatalf("write branch advance blob: %v", err)
+	}
+	found := false
+	for i := range entries {
+		if entries[i].Path == path {
+			entries[i].Object = object
+			found = true
+			break
+		}
+	}
+	if !found {
+		entries = append(entries, gitcli.TreeEntry{Mode: gitcli.ModeRegular, Object: object, Path: path})
+	}
+	tree, err := d.localGit.WriteTree(ctx, entries)
+	if err != nil {
+		t.Fatalf("write branch advance tree: %v", err)
+	}
+	commit, err := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+		Tree: tree, Parents: []string{base}, Author: testSignature, Committer: testSignature,
+		Message: message,
+	})
+	if err != nil {
+		t.Fatalf("write branch advance commit: %v", err)
+	}
+	if err := d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{{
+		Ref: testBranchRef, New: commit, ExpectedOld: base,
+	}}); err != nil {
+		t.Fatalf("push branch advance: %v", err)
+	}
+	if err := d.localGit.UpdateRef(ctx, testBranchRef, commit, base); err != nil {
+		t.Fatalf("advance local branch: %v", err)
+	}
+	return commit
 }
 
 // --- Validation tests ---
@@ -534,6 +580,57 @@ func TestDiscoverBranchDriftFromState(t *testing.T) {
 	}
 }
 
+func TestDiscoverAcceptsControlPlaneFastForward(t *testing.T) {
+	ctx := t.Context()
+	cache, sourceCommit := newTestSource(ctx, t, []string{testSourceTag})
+	d := newDiscoveryDest(ctx, t)
+	_, base, _ := d.publishedState(ctx, t, sourceCommit)
+	first := d.advanceBranch(ctx, t, base, "soapbox.yaml", "version: 2\n", "chore: update profile\n")
+	head := d.advanceBranch(ctx, t, first, "tools/go.sum", "canonical sums\n", "fix: update checksums\n")
+
+	discovery, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
+	if err != nil {
+		t.Fatalf("discover control-plane fast-forward: %v", err)
+	}
+	control := discovery.ControlPlaneBranch
+	if control == nil || control.Ref != testBranchRef || control.Base != base || control.Object != head || control.Source != sourceCommit {
+		t.Fatalf("control-plane branch = %#v, want %s..%s from %s", control, base, head, sourceCommit)
+	}
+	if discovery.AdoptedBranch != nil {
+		t.Errorf("control-plane fast-forward was treated as consumer adoption: %#v", discovery.AdoptedBranch)
+	}
+	if !discovery.FixedPoint() {
+		t.Errorf("control-plane-only discovery is not a fixed point: %#v", discovery)
+	}
+}
+
+func TestDiscoverRefusesControlPlaneGeneratedPath(t *testing.T) {
+	ctx := t.Context()
+	cache, sourceCommit := newTestSource(ctx, t, []string{testSourceTag})
+	d := newDiscoveryDest(ctx, t)
+	_, base, _ := d.publishedState(ctx, t, sourceCommit)
+	d.advanceBranch(ctx, t, base, "go.mod", "module example.invalid/drift\n", "chore: alter generated module\n")
+
+	_, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
+	if err == nil || !strings.Contains(err.Error(), "changes generated path go.mod") {
+		t.Fatalf("discover generated-path drift = %v, want generated path refusal", err)
+	}
+}
+
+func TestDiscoverRefusesControlPlaneSourceTrailer(t *testing.T) {
+	ctx := t.Context()
+	cache, sourceCommit := newTestSource(ctx, t, []string{testSourceTag})
+	d := newDiscoveryDest(ctx, t)
+	_, base, _ := d.publishedState(ctx, t, sourceCommit)
+	d.advanceBranch(ctx, t, base, "soapbox.yaml", "version: 2\n",
+		"chore: forge source mapping\n\nKubernetes-commit: "+sourceCommit+"\n")
+
+	_, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
+	if err == nil || !strings.Contains(err.Error(), "carries source-provenance trailer") {
+		t.Fatalf("discover control-plane trailer = %v, want provenance refusal", err)
+	}
+}
+
 // --- State-commit override ---
 
 func TestDiscoverStateCommitOverrideMismatch(t *testing.T) {
@@ -703,11 +800,15 @@ func TestDiscoverAdoptsLegacyFirstTag(t *testing.T) {
 	d := newDiscoveryDest(ctx, t)
 
 	cfg := discoveryConfig(sourceCommit)
-	// Build a published commit with the correct provenance trailer.
+	// Build a published commit with the correct provenance trailer while
+	// preserving the setup-derived control plane.
 	blob, _ := d.localGit.WriteBlob(ctx, []byte("published\n"))
-	tree, _ := d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
-		{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"},
-	})
+	entries, listErr := d.localGit.ListTree(ctx, d.parent)
+	if listErr != nil {
+		t.Fatalf("read control-plane tree: %v", listErr)
+	}
+	entries = append(entries, gitcli.TreeEntry{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"})
+	tree, _ := d.localGit.WriteTree(ctx, entries)
 	commitMessage := "Release " + testReleaseTag + "\n\n" + cfg.Commit.TrailerKey + ": " + sourceCommit + "\n"
 	destCommit, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Parents: []string{d.parent},
@@ -765,8 +866,13 @@ func TestDiscoverAdoptsLegacyFirstTag(t *testing.T) {
 		{Ref: "refs/tags/" + testReleaseTag, New: tagOID, ExpectAbsent: true},
 	})
 	d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent)
+	controlHead := d.advanceBranch(ctx, t, destCommit, "soapbox.yaml", "version: 2\n", "chore: migrate control plane\n")
 
-	disc, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
+	discoverOpts := d.opts(cache, sourceCommit)
+	discoverOpts.Config.Commit.Committer = config.Identity{
+		Name: "Replacement Bot", Email: "replacement@example.test",
+	}
+	disc, err := sync.Discover(ctx, discoverOpts)
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -792,15 +898,18 @@ func TestDiscoverAdoptsLegacyFirstTag(t *testing.T) {
 	if disc.Adopted.Source != sourceCommit {
 		t.Errorf("adopted source = %q, want %q", disc.Adopted.Source, sourceCommit)
 	}
-	// State HAS a Published branch, so no branch adoption is needed.
+	// State HAS a Published branch, so no branch adoption is needed. The
+	// operator-only fast-forward is retained separately as a graft point.
 	if disc.AdoptedBranch != nil {
 		t.Errorf("unexpected adopted branch %+v", disc.AdoptedBranch)
+	}
+	if disc.ControlPlaneBranch == nil || disc.ControlPlaneBranch.Base != destCommit || disc.ControlPlaneBranch.Object != controlHead {
+		t.Errorf("control-plane branch = %#v, want %s..%s", disc.ControlPlaneBranch, destCommit, controlHead)
 	}
 	tags, err := cache.ListTags(ctx)
 	if err != nil || len(tags) != 1 {
 		t.Fatalf("list source release = %#v, %v", tags, err)
 	}
-	discoverOpts := d.opts(cache, sourceCommit)
 	reconciliation, err := sync.PlanAdoptionReconciliation(ctx, sync.FinalizeOptions{
 		Config: discoverOpts.Config, Discovery: disc, SourceCache: cache,
 		Destination: sync.Destination{
@@ -824,6 +933,20 @@ func TestDiscoverAdoptsLegacyFirstTag(t *testing.T) {
 		return entry.Ref == "refs/tags/"+testReleaseTag && entry.Object == tagOID
 	}) {
 		t.Errorf("legacy reconciliation did not record tag: %#v", reconciled.Published)
+	}
+	if !slices.ContainsFunc(reconciled.Published, func(entry state.Published) bool {
+		return entry.Ref == testBranchRef && entry.Object == destCommit
+	}) {
+		t.Errorf("legacy reconciliation replaced generated branch image with control plane: %#v", reconciled.Published)
+	}
+	remoteRefs, err := d.localGit.RemoteRefs(ctx, d.remoteDir, format.HexLength())
+	if err != nil {
+		t.Fatalf("read reconciled refs: %v", err)
+	}
+	if !slices.ContainsFunc(remoteRefs, func(ref gitcli.Ref) bool {
+		return ref.Name == testBranchRef && ref.Target == controlHead
+	}) {
+		t.Errorf("reconciliation moved control-plane branch: %#v", remoteRefs)
 	}
 }
 
@@ -852,8 +975,8 @@ func TestDiscoverRefusesNonFirstTagAdoption(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for non-firstTag adoption")
 	}
-	if !strings.Contains(err.Error(), "only the configured firstTag") {
-		t.Fatalf("error %q does not explain firstTag restriction", err)
+	if !strings.Contains(err.Error(), "not recorded in state") {
+		t.Fatalf("error %q does not explain untracked tag refusal", err)
 	}
 }
 

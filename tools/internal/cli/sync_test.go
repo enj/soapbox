@@ -92,6 +92,14 @@ func TestSyncDecidesUsageBeforeReadingTheProfile(t *testing.T) {
 		name:       "unattended contradicts source-remote override",
 		args:       []string{"sync", cache, destination, "-unattended", "-source-remote=https://example.com/k.git"},
 		wantStderr: "-unattended derives the source from the profile, so -source-remote cannot also be given",
+	}, {
+		name:       "write verification contradicts unattended",
+		args:       []string{"sync", cache, destination, "-verify-write", "-unattended"},
+		wantStderr: "-verify-write is a no-op probe",
+	}, {
+		name:       "write verification contradicts override",
+		args:       []string{"sync", cache, destination, "-verify-write", "-tag=v1.36.1"},
+		wantStderr: "-verify-write derives every input",
 	}}
 
 	for _, tt := range tests {
@@ -126,7 +134,7 @@ func TestSyncIsDispatchableAndDocumented(t *testing.T) {
 	for _, flag := range []string{
 		"-destination string", "-remote string", "-identity string",
 		"-local-remote", "-state-commit string", "-apply", "-approve string",
-		"-unattended",
+		"-unattended", "-verify-write",
 	} {
 		if !strings.Contains(stdout, flag) {
 			t.Errorf("sync help does not document %q", flag)

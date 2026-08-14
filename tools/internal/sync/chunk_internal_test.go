@@ -2,8 +2,12 @@ package sync
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/enj/soapbox/tools/internal/config"
+	"github.com/enj/soapbox/tools/internal/state"
 )
 
 func TestWorkflowBudget(t *testing.T) {
@@ -45,5 +49,38 @@ func TestWorkflowBudget(t *testing.T) {
 				t.Fatalf("Check = %v, exhausted=%v", err, test.exhausted)
 			}
 		})
+	}
+}
+
+func TestConsumerChunkBaseUsesControlPlaneGraft(t *testing.T) {
+	t.Parallel()
+
+	base := strings.Repeat("a", 40)
+	overlay := strings.Repeat("b", 40)
+	sourceCommit := strings.Repeat("c", 40)
+	branchRef := "refs/heads/main"
+	discovery := &Discovery{
+		Observed: map[string]string{branchRef: overlay},
+		State: state.Document{
+			Cursors: []state.Cursor{{
+				Ref: "refs/tags/v1.36.1", Source: sourceCommit, Destination: base,
+			}},
+			Published: []state.Published{{
+				Ref: branchRef, Kind: state.KindBranch, Source: sourceCommit, Object: base,
+			}},
+		},
+		ControlPlaneBranch: &ControlPlaneBranch{
+			Ref: branchRef, Base: base, Object: overlay, Source: sourceCommit,
+		},
+	}
+	position, err := consumerChunkBase(ChunkOptions{
+		Config:    &config.Config{Destination: config.Destination{Branch: "main"}},
+		Discovery: discovery,
+	})
+	if err != nil {
+		t.Fatalf("consumer chunk base: %v", err)
+	}
+	if position.source != sourceCommit || position.destination != overlay || position.tag != "v1.36.1" {
+		t.Errorf("position = %#v, want source %s graft %s tag v1.36.1", position, sourceCommit, overlay)
 	}
 }

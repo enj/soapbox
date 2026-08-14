@@ -7,7 +7,7 @@ package buildinfo
 
 const (
 	// Version is the engine version. Released engines are tagged tools/vX.Y.Z.
-	Version = "0.2.0"
+	Version = "0.2.1"
 
 	// Toolchain is the exact Go toolchain the engine pins. Generated formatting
 	// and module metadata must be byte identical across machines, so the patch

@@ -55,6 +55,40 @@ func TestDiscoverReleasesOrdersAndFiltersTags(t *testing.T) {
 	}
 }
 
+func TestDiscoverReleasesSameMinorSkipsOtherBranch(t *testing.T) {
+	ctx := t.Context()
+	up := newUpstream(ctx, t)
+	tagRelease(ctx, t, up, "v1.36.2", up.merge, "1700000200 +0000")
+	tree, err := up.repo.Git.ResolveTree(ctx, up.merge)
+	if err != nil {
+		t.Fatalf("resolve tree: %v", err)
+	}
+	unrelated, err := up.repo.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
+		Tree: tree, Message: "next minor on another branch\n",
+		Author:    gitcli.Signature{Name: testUserName, Email: testUserEmail, Date: "1700000400 +0000"},
+		Committer: gitcli.Signature{Name: testUserName, Email: testUserEmail, Date: "1700000400 +0000"},
+	})
+	if err != nil {
+		t.Fatalf("write unrelated release: %v", err)
+	}
+	tagRelease(ctx, t, up, "v1.37.0-alpha.0", unrelated, "1700000500 +0000")
+	cache := openCache(ctx, t, up)
+	opts := releaseOptions(up.base)
+	opts.SameMinor = true
+	releases, err := cache.DiscoverReleases(ctx, opts)
+	if err != nil {
+		t.Fatalf("discover same-minor releases: %v", err)
+	}
+	got := make([]string, len(releases))
+	for i, release := range releases {
+		got[i] = release.Source.Name
+	}
+	want := []string{"v1.36.1", "v1.36.2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("same-minor releases = %v, want %v", got, want)
+	}
+}
+
 func TestDiscoverReleasesFailsClosed(t *testing.T) {
 	tests := []struct {
 		name    string

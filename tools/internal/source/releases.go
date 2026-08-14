@@ -23,6 +23,10 @@ type ReleaseOptions struct {
 	Policy string
 	// Anchor, when present, must be an ancestor of every selected release.
 	Anchor string
+	// SameMinor restricts selection to Minimum's major/minor release line. It is
+	// used for legacy state whose immutable anchor is the first patch release,
+	// which cannot prove ancestry for a later minor cut from another branch.
+	SameMinor bool
 }
 
 // Release is one selected, verified source release and its destination tag.
@@ -34,9 +38,10 @@ type Release struct {
 // DiscoverReleases selects verified semantic release tags from the source cache.
 //
 // Non-semantic tags are unrelated upstream refs and are ignored. A semantic tag
-// inside the selected range is part of the release stream: if it is lightweight,
-// outside the anchor, or cannot map under the configured policy, discovery fails
-// rather than silently skipping a release an unattended run should have seen.
+// inside the selected range (and, when SameMinor is set, the selected minor line)
+// is part of the release stream: if it is lightweight, outside the anchor, or
+// cannot map under the configured policy, discovery fails rather than silently
+// skipping a release an unattended run should have seen.
 func (c *Cache) DiscoverReleases(ctx context.Context, opts ReleaseOptions) ([]Release, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("discover source releases: %w", err)
@@ -72,6 +77,9 @@ func (c *Cache) DiscoverReleases(ctx context.Context, opts ReleaseOptions) ([]Re
 			continue
 		}
 		if version.Prerelease != "" && !opts.IncludePrereleases {
+			continue
+		}
+		if opts.SameMinor && (version.Major != minimum.Major || version.Minor != minimum.Minor) {
 			continue
 		}
 		if !tag.Annotated {

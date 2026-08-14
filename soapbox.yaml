@@ -13,17 +13,17 @@ source:
   project: Kubernetes
   license: Apache-2.0
   refs:
-    # The first public release is derived from Kubernetes v1.36.1. Later semantic
-    # tags, including prereleases, are tracked automatically.
+    # The first public release is derived from Kubernetes v1.36.1. Later tags on
+    # this anchored minor line, including prereleases, are tracked automatically.
     minimumRelease: v1.36.1
     includePrereleases: true
     branches:
       - master
       - release-1.36
-    # Resolved during setup to the common transformed anchor commit. It is
-    # written back here so ref discovery can never silently rewrite published
-    # history.
-    anchorCommit: ""
+    # The first published state predates common-anchor setup and is immutably
+    # anchored at v1.36.1. Persist that proof explicitly; unattended discovery
+    # remains on the v1.36 release line until a separately approved transition.
+    anchorCommit: 756939600b9a7180fc2df6550a4585b638875e67
 
 destination:
   module: monis.app/kk/rbac_authorizer

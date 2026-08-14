@@ -1537,8 +1537,44 @@ func TestPlanChunkCheckpointsResumesAndGraftsEpoch(t *testing.T) {
 		published["refs/tags/"+nextModuleTag].Object != finalPlan.Manifest.Objects.Tag {
 		t.Errorf("reconciled published refs = %#v", published)
 	}
-	if err := destination.Git.UpdateRef(ctx, "refs/heads/main", secondChunk.Track.Destination, consumerHead); err != nil {
-		t.Fatalf("advance local branch to reconciled consumer head: %v", err)
+	controlFiles, err := destination.Git.ListTree(ctx, secondChunk.Track.Destination)
+	if err != nil {
+		t.Fatalf("read generated consumer tree: %v", err)
+	}
+	controlBlob, err := destination.Git.WriteBlob(ctx, []byte("name: upgraded sync\n"))
+	if err != nil {
+		t.Fatalf("write control-plane blob: %v", err)
+	}
+	controlChanged := false
+	for i := range controlFiles {
+		if controlFiles[i].Path == ".github/workflows/sync.yml" {
+			controlFiles[i].Object = controlBlob
+			controlChanged = true
+			break
+		}
+	}
+	if !controlChanged {
+		t.Fatal("generated consumer tree has no sync workflow")
+	}
+	controlTree, err := destination.Git.WriteTree(ctx, controlFiles)
+	if err != nil {
+		t.Fatalf("write control-plane tree: %v", err)
+	}
+	controlHead, err := destination.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
+		Tree: controlTree, Parents: []string{secondChunk.Track.Destination},
+		Author: stateSignature, Committer: stateSignature,
+		Message: "chore: update control plane\n",
+	})
+	if err != nil {
+		t.Fatalf("write control-plane commit: %v", err)
+	}
+	if err := destination.Git.PushAtomic(ctx, remotePath, []gitcli.PushUpdate{{
+		Ref: "refs/heads/main", New: controlHead, ExpectedOld: secondChunk.Track.Destination,
+	}}); err != nil {
+		t.Fatalf("publish control-plane fast-forward: %v", err)
+	}
+	if err := destination.Git.UpdateRef(ctx, "refs/heads/main", controlHead, consumerHead); err != nil {
+		t.Fatalf("advance local branch to control-plane head: %v", err)
 	}
 	if err := destination.Git.UpdateRef(ctx, e.opts.Config.Destination.StateRef, trusted.State.Commit, priorRecord.Commit); err != nil {
 		t.Fatalf("advance local state ref: %v", err)
