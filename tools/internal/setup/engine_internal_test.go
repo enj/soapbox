@@ -3,6 +3,8 @@ package setup
 import (
 	"strings"
 	"testing"
+
+	"golang.org/x/mod/module"
 )
 
 // TestParseEnginePin covers the one input that decides what code a derived
@@ -86,6 +88,38 @@ func TestToolsModulePath(t *testing.T) {
 		if got := toolsModulePath(test.root); got != test.want {
 			t.Errorf("toolsModulePath(%q) = %q, want %q", test.root, got, test.want)
 		}
+	}
+}
+
+func TestRenderGoModMatchesTidyRequirementGroups(t *testing.T) {
+	t.Parallel()
+
+	got, err := renderGoMod(
+		"example.com/derived/tools",
+		[]module.Version{{Path: EngineModulePath, Version: "v0.2.0"}},
+		[]module.Version{
+			{Path: "golang.org/x/mod", Version: "v0.39.0"},
+			{Path: "gopkg.in/yaml.v3", Version: "v3.0.1"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("render go.mod: %v", err)
+	}
+	want := `module example.com/derived/tools
+
+go 1.26.0
+
+toolchain go1.26.5
+
+require github.com/enj/soapbox/tools v0.2.0
+
+require (
+	golang.org/x/mod v0.39.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+)
+`
+	if string(got) != want {
+		t.Errorf("go.mod =\n%s\nwant:\n%s", got, want)
 	}
 }
 

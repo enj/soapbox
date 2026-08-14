@@ -168,7 +168,10 @@ func renderGoMod(modulePath string, direct, indirect []module.Version) ([]byte, 
 	for _, version := range indirect {
 		required = append(required, &modfile.Require{Mod: version, Indirect: true})
 	}
-	file.SetRequire(required)
+	// The Go command keeps direct and indirect requirements in separate groups.
+	// Matching that canonical layout makes a freshly generated shim tidy-clean
+	// instead of asking its first build to rewrite tools/go.mod.
+	file.SetRequireSeparateIndirect(required)
 	file.Cleanup()
 
 	data, err := file.Format()
