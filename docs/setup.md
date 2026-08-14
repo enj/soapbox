@@ -176,10 +176,12 @@ points to the engine's own `go.mod` at that release (not the derived shim's).
 profile bytes to install, so a release may upgrade engine, workflow, dependency,
 and compatibility policy atomically. The target is decoded strictly, must be a
 regular file rather than a symlink, and may not retarget immutable source,
-destination, release, provenance-key, or vanity identity fields. Its exact bytes
-and the prior profile digest are included in the approval manifest. Without the
-flag, a current profile is retained and a schema-v1 profile receives only the
-default migration described below.
+destination, release, provenance-key, or vanity identity fields. The sole
+identity fill is resolving an empty `source.refs.anchorCommit`; once non-empty,
+that anchor is immutable too. Exact target bytes and the prior profile digest are
+included in the approval manifest. Without the flag, a current profile is
+retained and a schema-v1 profile receives only the default migration described
+below.
 
 The upgrade refuses to run on a dirty work tree, on a repository that is not
 setup-derived (the root `go.mod` must declare the destination module and
