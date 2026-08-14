@@ -363,11 +363,7 @@ func adoptedRelease(ctx context.Context, cfg *config.Config, cache *source.Cache
 	if anchor == "" {
 		anchor = discovery.State.Anchor.Source
 	}
-	releases, err := cache.DiscoverReleases(ctx, source.ReleaseOptions{
-		Minimum:            cfg.Source.Refs.MinimumRelease,
-		IncludePrereleases: cfg.Source.Refs.IncludePrereleases,
-		Policy:             cfg.Release.Policy, Anchor: anchor,
-	})
+	releases, err := cache.DiscoverReleases(ctx, sourceReleaseOptions(cfg, discovery.State, anchor))
 	if err != nil {
 		return source.Release{}, fmt.Errorf("reconciliation: discover adopted release: %w", err)
 	}

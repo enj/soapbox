@@ -7,6 +7,7 @@ import (
 	"github.com/enj/soapbox/tools/internal/config"
 	"github.com/enj/soapbox/tools/internal/gitcli"
 	"github.com/enj/soapbox/tools/internal/source"
+	"github.com/enj/soapbox/tools/internal/state"
 )
 
 func TestReconcileResultRenderingIsDeterministic(t *testing.T) {
@@ -59,6 +60,62 @@ func TestReconcileResultReportsFixedPointWriteVerification(t *testing.T) {
 	}
 	if !strings.Contains(result.Text(), "leased no-op push verified") {
 		t.Errorf("text does not report write verification:\n%s", result.Text())
+	}
+}
+
+func TestSourceReleaseOptionsBoundsLegacyAnchor(t *testing.T) {
+	t.Parallel()
+
+	const (
+		minimum = "v1.36.1"
+		anchor  = "756939600b9a7180fc2df6550a4585b638875e67"
+	)
+	cfg := &config.Config{
+		Source: config.Source{Refs: config.Refs{
+			MinimumRelease: minimum, IncludePrereleases: true,
+		}},
+		Release: config.Release{Policy: "v1-to-v0"},
+	}
+	tests := []struct {
+		name      string
+		document  state.Document
+		sameMinor bool
+	}{
+		{name: "no state"},
+		{
+			name: "legacy release anchor",
+			document: state.Document{
+				Schema: state.Schema,
+				Anchor: state.Anchor{Source: anchor, Ref: "refs/tags/" + minimum},
+			},
+			sameMinor: true,
+		},
+		{
+			name: "common branch anchor",
+			document: state.Document{
+				Schema: state.Schema,
+				Anchor: state.Anchor{Source: anchor, Ref: "refs/heads/release-1.36"},
+			},
+		},
+		{
+			name: "different anchor source",
+			document: state.Document{
+				Schema: state.Schema,
+				Anchor: state.Anchor{Source: strings.Repeat("a", 40), Ref: "refs/tags/" + minimum},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			opts := sourceReleaseOptions(cfg, test.document, anchor)
+			if opts.Minimum != minimum || !opts.IncludePrereleases || opts.Policy != "v1-to-v0" || opts.Anchor != anchor {
+				t.Fatalf("release options lost profile bounds: %#v", opts)
+			}
+			if opts.SameMinor != test.sameMinor {
+				t.Errorf("SameMinor = %t, want %t", opts.SameMinor, test.sameMinor)
+			}
+		})
 	}
 }
 

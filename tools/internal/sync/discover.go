@@ -151,6 +151,27 @@ func (d *Discovery) FixedPoint() bool {
 	return len(d.Pending) == 0 && d.Adopted == nil && d.AdoptedBranch == nil && d.ResolvedAnchor == nil
 }
 
+// sourceReleaseOptions keeps release-stream bounds identical across initial
+// discovery and any follow-up reconciliation of an adopted release.
+func sourceReleaseOptions(cfg *config.Config, stateDoc state.Document, anchor string) source.ReleaseOptions {
+	minimum := cfg.Source.Refs.MinimumRelease
+	// Legacy state created before common-anchor setup used the first release
+	// itself as its immutable anchor. Such an anchor proves only that release's
+	// minor line: a later minor may have branched before a patch release and is
+	// deliberately left for a separately approved profile/repository transition.
+	legacyMinorAnchor := stateDoc.Schema != 0 &&
+		stateDoc.Anchor.Ref == "refs/tags/"+minimum &&
+		stateDoc.Anchor.Source == anchor
+
+	return source.ReleaseOptions{
+		Minimum:            minimum,
+		IncludePrereleases: cfg.Source.Refs.IncludePrereleases,
+		Policy:             cfg.Release.Policy,
+		Anchor:             anchor,
+		SameMinor:          legacyMinorAnchor,
+	}
+}
+
 // Discover reads the destination and the source to decide what a
 // synchronization should do.
 //
@@ -294,22 +315,8 @@ func Discover(ctx context.Context, opts DiscoverOptions) (*Discovery, error) {
 		return nil, err
 	}
 
-	// Legacy state created before common-anchor setup used the first release
-	// itself as its immutable anchor. Such an anchor proves only that release's
-	// minor line: a later minor may have branched before a patch release and is
-	// deliberately left for a separately approved profile/repository transition.
-	legacyMinorAnchor := stateDoc.Schema != 0 &&
-		stateDoc.Anchor.Ref == "refs/tags/"+minimumRelease &&
-		stateDoc.Anchor.Source == anchorCommit
-
 	// Discover upstream releases.
-	releases, err := opts.SourceCache.DiscoverReleases(ctx, source.ReleaseOptions{
-		Minimum:            minimumRelease,
-		IncludePrereleases: opts.Config.Source.Refs.IncludePrereleases,
-		Policy:             opts.Config.Release.Policy,
-		Anchor:             anchorCommit,
-		SameMinor:          legacyMinorAnchor,
-	})
+	releases, err := opts.SourceCache.DiscoverReleases(ctx, sourceReleaseOptions(opts.Config, stateDoc, anchorCommit))
 	if err != nil {
 		return nil, fmt.Errorf("discovery: %w", err)
 	}
