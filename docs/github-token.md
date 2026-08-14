@@ -76,9 +76,12 @@ workflow self-applies:
   line; the engine deterministically replans and applies only an exact match.
   This is the default for new profiles.
 - **`automatic`** — the generated workflow adds `-unattended` to the sync
-  command. A scheduled or manually dispatched run self-applies the in-memory
+  command. A scheduled or ordinary manual dispatch self-applies the in-memory
   manifest under the trusted policy, so publication proceeds without further
-  human intervention once the profile has been approved.
+  human intervention once the profile has been approved. A manual dispatch may
+  instead set its boolean `verify-write` input; that selects `-verify-write`,
+  performs only an atomic leased no-op push of the current branch, and never
+  discovers or publishes a source release.
 
 ## Workflow token isolation
 
@@ -117,7 +120,7 @@ If upgrading from a schema v1 profile that used a GitHub App:
 2. Produce a target profile with the final dependency and compatibility policy
    but `publication.mode: manual`. Run the *target* engine binary (built from the
    approved engine candidate checkout, not the old v1 shim which lacks the
-   `upgrade` command) with `soapbox upgrade -engine-version tools/v0.2.0
+   `upgrade` command) with `soapbox upgrade -engine-version tools/v0.2.1
    -engine-mod <path/to/go.mod> -engine-sum <path/to/go.sum>
    -target-config <path/to/manual/soapbox.yaml>`.
 3. Review, approve, apply, and publish that exact manifest. The target profile is
@@ -131,12 +134,13 @@ If upgrading from a schema v1 profile that used a GitHub App:
    plan-only result.
 5. Repeat upgrade with the final target profile, changing publication to
    `automatic`, and publish that separately approved fast-forward commit.
-6. Dispatch the automatic workflow at the fixed point. An automatic fixed-point
-   run sends the unchanged consumer branch through an atomic, leased no-op push;
-   `writeVerified: true` therefore proves the job-scoped GITHUB_TOKEN reached
-   receive-pack with write access while every consumer, state, and progress ref
-   remained at its expected OID. App credentials stay until this replacement
-   has been live-verified under the outward-action manifest.
+6. Dispatch the automatic workflow with `verify-write: true`. That path skips
+   source discovery and sends the unchanged consumer branch through an atomic,
+   leased no-op push. `writeVerified: true` therefore proves the job-scoped
+   GITHUB_TOKEN reached receive-pack with write access while every consumer,
+   state, and progress ref remained at its expected OID—even when an upstream
+   release is pending. App credentials stay until this replacement has been
+   live-verified under the outward-action manifest.
 7. App secret removal, installation/App deletion, and local key removal belong
    in that same fresh outward-action manifest rather than a manual side step.
 

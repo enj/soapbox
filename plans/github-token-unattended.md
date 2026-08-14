@@ -161,12 +161,12 @@ The live `v0.36.1` remains external and untouched. The live profile changes to l
 
 ## Phase 6 — derived-repository migration and App decommission
 
-1. Bump/release the engine (expected `tools/v0.2.0`) only after local dual-mode and unattended proofs pass.
+1. Release the engine only after local dual-mode and unattended proofs pass. The initial implementation shipped as `tools/v0.2.0`; `tools/v0.2.1` adds fail-closed control-plane graft discovery and a destination-only `verify-write` dispatch required by the live migration.
 2. Use the new approval-gated upgrade command to produce an initial exact change for `enj/rbac_authorizer`: schema v2/profile local mode with **manual** publication, engine pin/checksums, GITHUB_TOKEN workflow, and committer identity.
 3. Rehearse against local bare HTTPS-like remotes with multiple upstream tags, merges, a crash mid-chunk, remote drift, token redaction, epoch change, and fixed-point reruns.
 4. Produce a fresh outward-action manifest containing the exact Soapbox engine tag, both derived control-plane commits, workflow/profile diffs, default-branch protection, ref leases/OIDs, and App cleanup.
 5. After approval, publish the engine and manual control-plane commit, then mark destination `main` protected with force pushes and deletions disabled but without rules that reject unsigned replay commits or job-scoped direct pushes. Dispatch and verify a manual plan-only run.
-6. Apply and publish the second exact control-plane commit, changing only publication policy and its generated workflow to automatic. Dispatch it against the fixed point; its atomic, leased no-op branch push must report `writeVerified: true`, every consumer/state/progress ref must remain unchanged, and no recursive CI run is expected.
+6. Apply and publish the second exact control-plane commit, changing only publication policy and its generated workflow to automatic. Dispatch it with `verify-write: true`; that destination-only path skips source discovery, its atomic leased no-op branch push must report `writeVerified: true`, every consumer/state/progress ref must remain unchanged, and no recursive CI run is expected even when a source release is pending.
 7. Only after replacement verification: delete the three App secrets, uninstall/delete the App, delete the local PEM, and verify the App reaches no repositories. Keep the tracked private-key ignore rule.
 8. Do not move `v0.36.1`; the automatic pipeline waits for and publishes only the next eligible release.
 

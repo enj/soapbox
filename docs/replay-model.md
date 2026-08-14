@@ -30,6 +30,22 @@ epoch. A new epoch starts on the current destination branch. Older tags are
 never regenerated under it. This is the rule that makes the immutability of
 published tags survive the engine changing.
 
+### Operator control-plane commits
+
+The consumer branch also carries setup-owned files such as `soapbox.yaml`, the
+nested engine shim, and workflows. Human-signed upgrades to those files are not
+images of a Kubernetes source commit, so state deliberately continues to record
+the last generated commit while the remote branch may fast-forward above it.
+
+Discovery accepts that split only after proving the remote head descends from the
+recorded generated object through a linear chain, every intervening commit lacks
+the configured source-provenance trailer, and every changed path is
+operator-owned. Any change to `go.mod`, `go.sum`, generated facade/provenance
+files, or `destination.internalPrefix` is fatal. The verified remote head becomes
+the graft point of the next profile epoch; the source cursor continues from the
+generated base. This preserves control-plane upgrades without falsely mapping one
+source commit to two destination commits.
+
 ## The mapping
 
 Each source commit maps to at most one destination commit, and several source
@@ -178,29 +194,37 @@ record level rather than only at the push:
 - a published tag is compared for equality on object and source under every
   condition, including a profile change, and may never be dropped.
 
-## What is implemented today
+## Implemented pipeline
 
-Replay, projection, publication, and the state record are implemented and tested
-against real temporary repositories. The pipeline that drives them is narrower
-than they are:
+Replay, projection, publication, recovery, and state are integrated and tested
+against real temporary repositories:
 
-1. **One commit per replay.** The release commit is replayed as the root of its
-   own epoch, with upstream parents deliberately absent. Multi-commit traversal,
-   anchor bounding, merge shaping, parent dedup, and collapse are exercised by
-   tests, not by a pipeline.
-2. **Release tags only.** A branch is refused, because intermediate staging
-   resolution is not wired to verified repository URLs.
-3. **No backfill.** A state record naming an earlier release is refused: the
-   commits between it and this run would have to be replayed. Progress refs and
-   tracks are defined, validated, and never emitted, and `chunkSize` is unused.
-4. **No epoch graft.** A state record written under a different profile hash is
-   refused rather than grafted.
-5. **No network publication.** Deciding what a push would do requires listing
-   the destination's refs, and only a filesystem destination implements that
-   today. A local rehearsal with `-local-remote` is the working path.
-6. **The state record omits the release tag.** It records the consumer branch
-   only, because the record refuses two destination objects claiming one source
-   commit.
+1. **Relevant DAG replay.** Each range is bounded by the recorded source position
+   and pending release. A directory-granular watched set prefilters unrelated
+   commits; relevant commits are generated at their exact OIDs. Merge parents are
+   preserved and unchanged trees collapse.
+2. **Intermediate dependency resolution.** Source commits map through bounded
+   staging publishing histories. The Go command names pseudo-versions; Soapbox
+   neither invents them nor fetches arbitrary object names.
+3. **Resumable chunks.** Long ranges advance state and
+   `refs/soapbox/progress/<release>` in non-consumer atomic pushes. The reachable
+   mapping blob, digest, and entry count restore the exact version index after a
+   restart. Consumer refs move only after the completed range passes release
+   gates.
+4. **Profile epoch grafting.** A changed output profile begins a new epoch on the
+   verified current control-plane head. Earlier immutable tags are never
+   regenerated.
+5. **Authenticated network publication.** Destination refs and state are read
+   over HTTPS, writes use the repository-scoped job `GITHUB_TOKEN`, and source Git
+   plus Go subprocesses remain credential-free. Every push is atomic,
+   fast-forward-only, and compare-and-swap leased.
+6. **Crash reconciliation and fixed points.** State records both consumer branch
+   and tag observations. A crash after consumer publication is adopted only after
+   exact tag, provenance, cursor, and completed-track proof. Repeated runs
+   converge to no generation or ref movement.
 
-Each of these is a refusal with its own message rather than a silent
-approximation. The engine says which run shape it cannot serve.
+A legacy state record whose immutable anchor is the first patch release can only
+prove that release's minor line. Discovery therefore ignores later minor tags
+until a separately approved transition provides a common source anchor; tags in
+the anchored line remain fail-closed. Repository creation and vanity-page
+publication remain one-time outward bootstrap actions rather than sync behavior.

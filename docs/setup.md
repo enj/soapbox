@@ -120,8 +120,9 @@ it is the one path the engine allows to live inside the cache.
 ### setup
 
 ```text
-go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.1.0
-go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.1.0 \
+go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.2.1 \
+    -engine-sum /tmp/engine.sum
+go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.2.1 \
     -engine-sum /tmp/engine.sum -apply -approve <hash>
 ```
 
@@ -148,7 +149,7 @@ than publish an unmaintainable generated-only root. See
 ### upgrade
 
 ```text
-soapbox upgrade -engine-version tools/v0.2.0 \
+soapbox upgrade -engine-version tools/v0.2.1 \
     -engine-mod /path/to/engine/go.mod \
     -engine-sum /path/to/engine/go.sum \
     -target-config /path/to/approved/soapbox.yaml
@@ -163,7 +164,7 @@ explicit `-target-config` changes it.
 **Bootstrap note**: a schema-v1 derived shim is pinned to `tools/v0.1.0` and
 does not contain the `upgrade` command. Run the *target* engine binary — built
 from the approved engine candidate checkout or, once released, via
-`go run github.com/enj/soapbox/tools/cmd/soapbox@v0.2.0` — against
+`go run github.com/enj/soapbox/tools/cmd/soapbox@v0.2.1` — against
 `-dir <derived>`, not the old `tools/cmd/soapbox` shim inside the derived
 repository.
 
@@ -334,7 +335,7 @@ on pull request code, and there is no `pull_request_target` trigger. The job
 refuses to run from any ref but the protected default branch, serializes on the
 non-cancelling concurrency group `soapbox-sync`, and holds `contents: write`
 plus `actions: read`. It first builds the Soapbox binary in a tokenless step.
-Only the execution step receives `SOAPBOX_GITHUB_TOKEN`:
+Only execution steps receive `SOAPBOX_GITHUB_TOKEN`:
 
 ```text
 ${{ runner.temp }}/soapbox sync -dir .. -destination .. -cache ${{ runner.temp }}/soapbox-cache
@@ -344,10 +345,15 @@ ${{ runner.temp }}/soapbox sync -dir .. -destination .. -cache ${{ runner.temp }
 emits the exact next checkpoint or release plan without applying it. A second
 manual dispatch may carry that hash in the optional `approve` input; the hash is
 validated from `SOAPBOX_APPROVAL`, the step deterministically replans, and only
-an exact match applies. `publication.mode: automatic` adds `-unattended`; after the workflow context,
-protected branch, enabled workflow, destination state, and in-memory plan hash
-have all been verified, the same command applies progress/state checkpoints and
-final consumer refs without a copied hash from stdout.
+an exact match applies.
+
+`publication.mode: automatic` normally adds `-unattended`; after the workflow
+context, protected branch, enabled workflow, destination state, and in-memory
+plan hash have all been verified, it applies progress/state checkpoints and final
+consumer refs without a copied hash from stdout. Its manual dispatch also exposes
+an optional boolean `verify-write` input. When true, a separate `-verify-write`
+step skips source discovery and proves write access with an atomic leased no-op
+push of the current branch.
 
 Both workflows pin their actions to full commit object names.
 

@@ -36,7 +36,7 @@ The schema version. The only accepted value is `2`.
 | `minimumRelease` | The first upstream release, `v1.36.1`. Used as the default ref by `plan`, `generate`, and `sync`, and as the baseline for override expiry. |
 | `includePrereleases` | Whether later prerelease tags are tracked. |
 | `branches` | Tracked upstream branches. Patch branch selectors must name one of these. |
-| `anchorCommit` | Resolved during setup to the common transformed anchor and written back, so ref discovery can never silently rewrite published history. Empty until then. |
+| `anchorCommit` | The immutable source-history anchor, persisted before automatic operation. New repositories use a common transformed ancestor of every tracked release branch. Legacy state may instead be anchored at `minimumRelease`; in that case discovery is deliberately limited to that release's major/minor line because a later minor may have branched before the patch anchor. |
 
 ## `destination`
 

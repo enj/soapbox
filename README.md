@@ -72,8 +72,8 @@ go run ./cmd/soapbox validate -dir ..
 go run ./cmd/soapbox doctor -dir ..
 go run ./cmd/soapbox plan -dir .. -tag v1.36.1
 go run ./cmd/soapbox generate -dir .. -cache /absolute/cache -tag v1.36.1
-go run ./cmd/soapbox setup -dir .. -engine-version v0.1.0
-go run ./cmd/soapbox upgrade -engine-version tools/v0.2.0 -engine-mod ... -engine-sum ... -target-config ../soapbox.yaml
+go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.2.1 -engine-sum ...
+go run ./cmd/soapbox upgrade -engine-version tools/v0.2.1 -engine-mod ... -engine-sum ... -target-config ../soapbox.yaml
 go run ./cmd/soapbox sync ...
 ```
 
