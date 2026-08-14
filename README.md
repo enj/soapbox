@@ -17,16 +17,11 @@ The first target is `monis.app/kk/rbac_authorizer`, sourced from `plugin/pkg/aut
 
 ## Status
 
-The local engine, release projection, replay, state, GitHub App client, setup transformation, and append-only publication planner are implemented. The real Kubernetes RBAC dry run is complete and documented in [`docs/rbac-v1.36.1-proof.md`](docs/rbac-v1.36.1-proof.md). The remaining delivery gate is review and fresh approval of the exact outward-action manifest. No remote repository, vanity page, network branch, or public module tag is created by the development workflow.
+The deterministic engine is implemented, and `monis.app/kk/rbac_authorizer@v0.36.1` is published and immutable. The follow-on engine now discovers HTTPS destination refs and pending releases, maps release-bounded exact commits to Go-resolved staging pseudo-versions, replays relevant DAG history in resumable chunks, grafts profile epochs, and reconciles append-only publication with the repository-scoped `GITHUB_TOKEN`. Current migration changes remain local until a new exact outward-action manifest is reviewed and approved.
 
 The durable requirements and approved design are in [`plans/`](plans/).
 
-Known limitations of the engine as it stands are listed in
-[docs/setup.md](docs/setup.md#current-limitations). In short: exact release tags
-only, no branch generation, no retained-reference type rewrite, no backfill of
-prior releases, no epoch graft, no staging-package materialization, no vanity
-page generation, and publication rehearsed against a local destination because
-listing a network remote's refs is not yet implemented.
+Known limitations are listed in [docs/setup.md](docs/setup.md#current-limitations). The public `generate` command still accepts reviewed release tags rather than moving branch names; exact-commit generation is an engine-only surface bounded by discovered releases. Remote repository creation, vanity changes, engine tags, and module tags remain outside the unattended engine and require a separately approved outward-action manifest.
 
 ## Architecture
 
@@ -59,8 +54,8 @@ soapbox/
     └── internal/           config, gitcli, source, closure, patchset,
                             relocate, rewrite, gomodmap, modgen, deppolicy,
                             typeswap, facade, provenance, treebuild, replay,
-                            release, publish, state, ghapp, ghapi, extract,
-                            generate, sync, setup, doctor, cli
+                            release, publish, state, ghapi, extract,
+                            generate, sync, setup, upgrade, doctor, cli
 ```
 
 A derived repository keeps its facade, assertions, `internal/kk/<upstream
@@ -78,10 +73,11 @@ go run ./cmd/soapbox doctor -dir ..
 go run ./cmd/soapbox plan -dir .. -tag v1.36.1
 go run ./cmd/soapbox generate -dir .. -cache /absolute/cache -tag v1.36.1
 go run ./cmd/soapbox setup -dir .. -engine-version v0.1.0
+go run ./cmd/soapbox upgrade -engine-version tools/v0.2.0 -engine-mod ... -engine-sum ... -target-config ../soapbox.yaml
 go run ./cmd/soapbox sync ...
 ```
 
-`plan`, `generate`, `setup`, and `sync` are dry-run oriented. Operations that write an approved local transformation or move refs require the exact manifest hash produced by the corresponding plan. Generation currently supports exact release tags; intermediate-commit staging resolution and staging-package materialization remain fail-closed.
+`plan`, `generate`, `setup`, `upgrade`, and `sync` are dry-run oriented. Operations that write an approved local transformation or move refs require the exact manifest hash produced by the corresponding plan. Generation supports exact release tags and already-fetched, release-bounded commit OIDs; intermediate staging versions are resolved by Go from bounded publishing history, and approved staging copies are materialized only after their policy gates pass.
 
 Exit codes are part of the workflow contract and are stable: `0` success, `1`
 runtime failure, `2` usage, `3` the command ran and found policy violations, and
@@ -105,10 +101,18 @@ documentation is in [docs/setup.md](docs/setup.md#the-commands).
    because the retained code already uses `k8s.io/api/rbac/v1`; this is a
    reachability proof, not a claim that the intentionally different internal and
    public declarations have identical tags or methods;
-5. dependency policy `external` with an empty copy list, recorded in
-   [docs/decisions/0001-no-staging-copy-rbac.md](docs/decisions/0001-no-staging-copy-rbac.md);
-6. 16 facade exports, 4 renaming aliases, and 2 compile-time assertions against
-   the real `k8s.io/apiserver` authorizer interfaces.
+5. dependency policy `copy-approved`: one pure-leaf package copied from
+   `k8s.io/component-helpers/auth/rbac/validation`, removing and then forbidding
+   the `k8s.io/component-helpers` module; and
+6. `compatibility.apiserver: local`: generated module-local authentication and
+   authorization declarations, explicit no-escalation identity inputs, 34 facade
+   entries, and a forbidden `k8s.io/apiserver` module.
+
+The already-published `v0.36.1` artifact remains external and immutable. The
+local profile applies only to the next eligible release, which begins a new
+profile epoch without moving or regenerating that tag. The two modes and their
+control-pair measurements are documented in
+[docs/apiserver-compatibility.md](docs/apiserver-compatibility.md).
 
 Pruning the registration, conversion, and defaulting files stops import-time
 mutation of the `k8s.io/api/rbac/v1` scheme builder. That is an intentional
@@ -125,10 +129,11 @@ behaviour change, and it is recorded as one in
 - [Provenance and licence evidence](docs/provenance.md)
 - [Intentional RBAC behavior changes](docs/behavior-changes.md)
 - [Dependency copy policy](docs/dependency-policy.md)
-- [GitHub App setup](docs/github-app.md)
+- [Apiserver compatibility modes](docs/apiserver-compatibility.md)
+- [GitHub token and publishing](docs/github-token.md)
 - [Vanity import bootstrap](docs/vanity.md)
 - [Conflict and recovery runbook](docs/conflict-runbook.md)
-- [Why RBAC copies no staging dependency](docs/decisions/0001-no-staging-copy-rbac.md)
+- [Original RBAC staging-copy decision and follow-on](docs/decisions/0001-no-staging-copy-rbac.md)
 
 ## Development checks
 
@@ -154,7 +159,7 @@ pin every action to a full commit object name.
 
 All maintained executable logic is Go. The engine invokes installed `git` and `go` executables only through typed subprocess boundaries; it contains no shell command construction.
 
-GitHub credentials are short-lived App installation tokens, never PATs, and never appear in command arguments, remote URLs, reports, or artifacts. The App is never installed on `kubernetes/kubernetes`.
+GitHub credentials are the built-in `GITHUB_TOKEN` provided by GitHub Actions, scoped to the repository and expired at job end. Credentials never appear in command arguments, remote URLs, reports, or artifacts.
 
 Remote creation, vanity metadata changes, and immutable module publication require a separately reviewed outward-action manifest and a fresh approval of its hash.
 

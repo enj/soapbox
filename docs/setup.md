@@ -32,6 +32,7 @@ plan      compute the extraction plan for one upstream ref
 generate  compose the generated module for one upstream release tag
 sync      plan, and with an approval publish, one upstream release
 setup     transform this template checkout into one derived repository
+upgrade   upgrade setup-owned files in a derived repository to a new engine
 version   print the engine version
 help      print usage for soapbox or one command
 ```
@@ -95,9 +96,9 @@ composition, so it needs no Go toolchain and no module proxy.
 and reports without leaving a tree behind. `-report <path>` writes the JSON
 report even when the run is refused, which is what makes a refusal reviewable.
 
-`plan` refuses to start if any of the three GitHub App environment variable
-names named in the profile are set. A plan needs no credential, so holding one
-is a configuration error rather than a convenience.
+`plan` refuses to start if `SOAPBOX_GITHUB_TOKEN` is set in the environment. A
+plan needs no credential, so holding one is a configuration error rather than a
+convenience.
 
 ### generate
 
@@ -143,6 +144,61 @@ patches, the pinned `tools` shim, workflows, and other operator-owned files whil
 replacing the generated module paths; it refuses an empty destination rather
 than publish an unmaintainable generated-only root. See
 [Publication](#publication) for what is and is not possible today.
+
+### upgrade
+
+```text
+soapbox upgrade -engine-version tools/v0.2.0 \
+    -engine-mod /path/to/engine/go.mod \
+    -engine-sum /path/to/engine/go.sum \
+    -target-config /path/to/approved/soapbox.yaml
+```
+
+Upgrades the setup-owned files in a derived repository to a new engine release.
+The root `go.mod` (generated module output) is never overwritten. The nested
+`tools/go.mod`, `tools/go.sum`, engine shim, and two workflows are always
+upgrade-owned. `soapbox.yaml` is upgrade-owned only when schema migration or an
+explicit `-target-config` changes it.
+
+**Bootstrap note**: a schema-v1 derived shim is pinned to `tools/v0.1.0` and
+does not contain the `upgrade` command. Run the *target* engine binary — built
+from the approved engine candidate checkout or, once released, via
+`go run github.com/enj/soapbox/tools/cmd/soapbox@v0.2.0` — against
+`-dir <derived>`, not the old `tools/cmd/soapbox` shim inside the derived
+repository.
+
+Required flags: `-engine-version` names the target release. `-engine-mod`
+points to the engine's own `go.mod` at that release (not the derived shim's).
+`-engine-sum` provides the verified `go.sum` for the nested tools module.
+
+`-target-config` is optional. When supplied, it names the exact current-schema
+profile bytes to install, so a release may upgrade engine, workflow, dependency,
+and compatibility policy atomically. The target is decoded strictly, must be a
+regular file rather than a symlink, and may not retarget immutable source,
+destination, release, provenance-key, or vanity identity fields. Its exact bytes
+and the prior profile digest are included in the approval manifest. Without the
+flag, a current profile is retained and a schema-v1 profile receives only the
+default migration described below.
+
+The upgrade refuses to run on a dirty work tree, on a repository that is not
+setup-derived (the root `go.mod` must declare the destination module and
+`tools/go.mod` must pin the engine), or on a downgrade (a target version older
+than the current pin). Every update action records a preimage digest, and Apply
+verifies the preimage still matches before the first write. Non-regular files
+(symlinks, devices, directories) at owned paths are refused.
+
+A schema v1 profile with a `githubApp` section is migrated to v2
+automatically: the `githubApp` section is removed, `publication.mode` is set to
+`manual`, and `compatibility.apiserver` to `external`. The migrated
+`soapbox.yaml` is included in the manifest so the approval hash binds the
+profile change. The legacy profile is validated strictly under the v1 schema
+(unknown fields, missing App section, and invalid App env names are rejected)
+before migration.
+
+Without `-apply` the command reports the manifest and writes nothing.
+`-apply -approve <hash>` writes the exact manifest that hash names.
+`-report <path>` writes the JSON manifest to a file. `-format json` outputs
+JSON to stdout.
 
 ## What setup does
 
@@ -270,74 +326,65 @@ module tree. `refs/soapbox/progress/` is reserved for gated backfill chunks.
 `ci.yml` runs on pushes and pull requests to the default branch with
 `permissions: {}` at the top level and `contents: read` on the job. It builds,
 vets, and tests the root module and the shim, then runs
-`go run ./cmd/soapbox validate -dir ..`. It never sees an App secret and the
-checkout keeps no token.
+`go run ./cmd/soapbox validate -dir ..`. It never receives write credentials
+and the checkout keeps no token.
 
 `sync.yml` runs on `schedule` at `37 4 * * *` and on `workflow_dispatch`, never
 on pull request code, and there is no `pull_request_target` trigger. The job
 refuses to run from any ref but the protected default branch, serializes on the
-non-cancelling concurrency group `soapbox-sync`, and holds `contents: read` plus
-`actions: read` — the workflow token cannot write. All maintained logic is one
-invocation:
+non-cancelling concurrency group `soapbox-sync`, and holds `contents: write`
+plus `actions: read`. It first builds the Soapbox binary in a tokenless step.
+Only the execution step receives `SOAPBOX_GITHUB_TOKEN`:
 
 ```text
-go run ./cmd/soapbox sync -dir .. -destination .. -cache ${{ runner.temp }}/soapbox-cache
+${{ runner.temp }}/soapbox sync -dir .. -destination .. -cache ${{ runner.temp }}/soapbox-cache
 ```
 
-It carries no `-apply`. A scheduled workflow that published without an approval
-would be an outward action nobody authorized, so enabling publication is a
-deliberate edit made at the outward-action gate rather than a default the
-template ships.
+`publication.mode: manual` lists HTTPS refs, discovers pending releases, and
+emits the exact next checkpoint or release plan without applying it. A second
+manual dispatch may carry that hash in the optional `approve` input; the hash is
+validated from `SOAPBOX_APPROVAL`, the step deterministically replans, and only
+an exact match applies. `publication.mode: automatic` adds `-unattended`; after the workflow context,
+protected branch, enabled workflow, destination state, and in-memory plan hash
+have all been verified, the same command applies progress/state checkpoints and
+final consumer refs without a copied hash from stdout.
 
 Both workflows pin their actions to full commit object names.
 
 ## Publication
 
-Publication does not work against a network remote today. Deciding what a push
-would do requires listing the destination's refs, the typed Git boundary does
-not expose `ls-remote`, and only a filesystem destination implements the
-listing interface. A network destination is refused with
-`publication requires a configured destination remote` wrapping
-`listing refs of a network remote needs a gitcli remote ref API`.
+The typed Git boundary lists HTTPS refs, fetches exact advertised state and tag
+objects without moving consumer refs or writing `FETCH_HEAD`, and publishes with
+atomic compare-and-swap leases. Long histories advance only state and
+`refs/soapbox/progress/*` between chunks. The consumer branch and immutable tag
+move together only after the complete release passes all generation and module
+gates. A post-publication state push atomically leases unchanged branch, tag,
+and progress observations so a concurrent ref change cannot be recorded as
+fact.
 
-What works is a local rehearsal: `-destination` pointing at a real repository on
-disk with `-local-remote` to permit it. That is the shape the Phase 7 dry run
-uses.
+Local rehearsals remain available with `-local-remote`. Network publication is
+available only in a validated same-repository Actions context through the
+job-scoped `GITHUB_TOKEN`.
 
 ## Current limitations
 
-These are properties of the engine as it stands, not of the design.
+These are properties of the engine as it stands, not of the approved design.
 
-1. **Release tags only.** `generate` and `sync` accept a source tag that maps
-   under the release policy. A branch is refused: *"only a release tag can be
-   generated from until intermediate staging resolution is wired to verified
-   repository URLs"*. Commit-to-staging-version mapping is implemented and
-   tested in `gomodmap` but no pipeline calls it.
-2. **No staging copy materialization.** A profile proposing copies is refused
-   before the policy runs, and an approved copy is refused after it. Both say
-   *"materializing a copied package is not implemented"*. The RBAC profile
-   copies nothing, so this bounds nothing it needs.
-3. **No retained-reference type rewrite.** `prefer-external` proves both
-   dead-package pruning and actual substitution. Generation applies the first
-   and refuses the second as unsupported until the enumerated reference edits
-   are applied to the generated bytes. RBAC follows the dead-package path.
-4. **No backfill.** `sync` publishes one release. Resuming from a state record
-   that names an earlier release is refused: the commits between them would have
-   to be replayed. Progress refs are defined, validated, and never emitted;
-   `determinism.chunkSize` is validated and unused.
-5. **No epoch graft.** A state record written under a different profile hash is
-   refused rather than grafted onto a new epoch.
-6. **One upstream commit per replay.** The pipeline attaches the transformed
-   release commit to the setup-derived control-plane commit. Multi-commit
-   traversal, anchor bounding, merge shaping, parent dedup, and unchanged-tree
-   collapse are implemented and tested but no pipeline drives them yet.
-7. **The state record omits the release tag.** It records the consumer branch
-   only, because the record refuses two destination objects claiming one source
-   commit.
-8. **No vanity page generation.** See [vanity.md](vanity.md).
-9. **No repository creation.** The GitHub API client can read a repository,
-   list installation repositories, read a workflow, and manage issues. It cannot
-   create a repository.
+1. **Moving branch names are preview-only.** Public `generate` and manual exact
+   `sync` calls select reviewed release tags. Unattended reconciliation uses an
+   engine-only exact-commit selector after a release head and immutable lower
+   anchor have bounded the source history.
+2. **Retained-reference type rewrites remain profile-specific.** The generic
+   `prefer-external` analysis proves substitutions, but a substitution that
+   changes retained source still needs an enumerated deterministic rewrite.
+3. **One consumer release per workflow invocation.** A run may apply many
+   progress chunks within its budget, but stops after publishing and reconciling
+   one immutable release so the next invocation starts from a fresh checkout of
+   that exact consumer head.
+4. **No vanity page generation.** See [vanity.md](vanity.md).
+5. **No repository creation.** Repository creation and all other bootstrap
+   actions remain outside unattended sync and require a separately approved
+   outward-action manifest.
 
 ## Where to look next
 
@@ -349,6 +396,6 @@ These are properties of the engine as it stands, not of the design.
 | What the generated module records about its origin | [provenance.md](provenance.md) |
 | What the generated module does differently from upstream | [behavior-changes.md](behavior-changes.md) |
 | When a staging package may be copied | [dependency-policy.md](dependency-policy.md) |
-| How the publishing identity is set up | [github-app.md](github-app.md) |
+| How the publishing identity is set up | [github-token.md](github-token.md) |
 | How `monis.app/kk/...` resolves | [vanity.md](vanity.md) |
 | What to do when a run is refused | [conflict-runbook.md](conflict-runbook.md) |

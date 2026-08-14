@@ -1,8 +1,15 @@
 # 0001. No staging copy for the RBAC authorizer
 
-**Status:** accepted
+**Status:** partially superseded (2026-08-13)
 **Applies to:** `monis.app/kk/rbac_authorizer`, from Kubernetes `v1.36.1`
-**Profile:** `dependencies.policy: external`, `copyPackages: []`
+**Profile:** `dependencies.policy: copy-approved`, one package copied
+
+## Original decision (accepted, still holds for apiserver)
+
+The original decision to keep `k8s.io/apiserver` and `k8s.io/component-base`
+external remains in force. The five-package apiserver copy proposal was refused
+by correctness gates (interoperability, diamond, globalState) even with all cost
+overrides applied. See the detailed gate refusals below, which are unchanged.
 
 ## Context
 
@@ -151,3 +158,37 @@ would mean it had stopped being an authorizer.
 The refusal is pinned by a policy fixture and a golden decision record, so a
 future profile that proposes this copy fails a test rather than merely
 disagreeing with a document.
+
+## Follow-on: k8s.io/component-helpers (2026-08-13)
+
+The profile now copies one pure-leaf package from `k8s.io/component-helpers`:
+
+```text
+staging/src/k8s.io/component-helpers/auth/rbac/validation
+```
+
+This package imports only `k8s.io/api/rbac/v1` and the standard library. It
+owns no types crossing the generated public boundary, registers no global
+state, and creates no diamond. At v0.36.1 it is one 173-line Go file in a
+132,582-byte module zip, under one Apache-2.0 grant; release-bounded cadence is
+eight versions through v0.36.1. Copying it removes exactly the
+`k8s.io/component-helpers` module while replacing its one compiled package
+one-for-one.
+
+The path-based `securityCritical` gate is explicitly overridden through v1.36:
+this is RBAC comparison code, so Soapbox accepts CVE-response ownership only
+with release-bounded regeneration and a differential test against the exact
+upstream module. A second v1.36 override records that `go/packages` reports zero
+external dependency lines even though measured module and package removals are
+both one; the independent 200-line copy ceiling still applies. Focused cases
+and 10,000 deterministic randomized rule pairs produced byte-identical `Covers`
+results and uncovered-rule lists.
+
+The module is then added to `forbiddenModules`, which is enforced across five
+surfaces: raw Go imports (module-boundary exact match), go.mod, go.sum,
+`go list -m all`, and typed module graph identities.
+
+This does not weaken the apiserver decision. The five apiserver packages are
+still refused by correctness gates. The component-helpers copy is a separate,
+narrower proposal that passes every gate because the package is a pure leaf
+utility with no API types, no global state, and no diamond path.

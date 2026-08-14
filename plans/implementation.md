@@ -6,7 +6,7 @@
 
 The first live output is `github.com/enj/rbac_authorizer`, imported as `monis.app/kk/rbac_authorizer`. Its first public version will be `v0.36.1`, derived from Kubernetes `v1.36.1`. Later Kubernetes `v1.X.Y` tags, including prereleases, map to module `v0.X.Y` tags.
 
-The approved goal and this implementation plan will remain in the repository under `plans/`. `goal.md` moves to `plans/goal.md`, and this approved plan is copied to `plans/implementation.md` as the durable execution reference.
+The approved goal and this implementation plan will remain in the repository under `plans/`. `goal.md` moves to `plans/goal.md`, and this approved plan is copied to `plans/implementation.md` as the durable execution reference. The approved follow-on plan for GITHUB_TOKEN publishing, unattended reconciliation, and module dependency modes is [`plans/github-token-unattended.md`](github-token-unattended.md).
 
 The implementation has five hard constraints:
 
@@ -16,7 +16,7 @@ The implementation has five hard constraints:
 4. Every human commit in `enj/soapbox` is SSH signed, has author and committer `Monis Khan <i@monis.app>`, and contains exactly `Signed-off-by: Monis Khan <mok@microsoft.com>`.
 5. Published module tags are immutable. Initial publication happens only after a local dry run and a separate explicit approval of the exact repositories, vanity page diff, refs, tag objects, and commit OIDs.
 
-Generated replay commits preserve the upstream author, author date, message, relevant graph relationships, and a `Kubernetes-commit: <sha>` trailer. A GitHub App bot is the committer. Generated commits are unsigned.
+Generated replay commits preserve the upstream author, author date, message, relevant graph relationships, and a `Kubernetes-commit: <sha>` trailer. The `github-actions[bot]` identity is the committer. Generated commits are unsigned.
 
 ## Architecture
 
@@ -53,7 +53,7 @@ soapbox/
 │   ├── provenance.md
 │   ├── behavior-changes.md
 │   ├── dependency-policy.md
-│   ├── github-app.md
+│   ├── github-token.md
 │   ├── vanity.md
 │   ├── conflict-runbook.md
 │   └── decisions/0001-no-staging-copy-rbac.md
@@ -86,8 +86,8 @@ soapbox/
         ├── replay/
         ├── publish/
         ├── state/
-        ├── ghapp/
         ├── ghapi/
+        ├── upgrade/
         ├── vanity/
         ├── verify/
         ├── report/
@@ -133,7 +133,7 @@ rbac_authorizer/
 6. Dependency policy `external` by default, an empty staging copy list for RBAC, non-overridable correctness gates, and expiring cost overrides.
 7. Destination module `monis.app/kk/rbac_authorizer`, internal prefix `internal/kk`, repository `enj/rbac_authorizer`, and public root package `rbacauthorizer`.
 8. Ordered patch files with ancestry based `since` and `until` selectors plus branch selectors.
-9. Explicit facade exports, aliases, interface implementation assertions, staging dependency mapping, bot identity, release mapping, deterministic Go toolchain, GitHub App secret names, and vanity location `enj/enj.github.io:kk/rbac_authorizer/index.html`.
+9. Explicit facade exports, aliases, interface implementation assertions, staging dependency mapping, bot identity, release mapping, deterministic Go toolchain, publication mode, compatibility mode, and vanity location `enj/enj.github.io:kk/rbac_authorizer/index.html`.
 
 Every configured path is relative, traversal free, and checked after symlink resolution to remain inside its permitted root. Source and destination URLs are host allowlisted. Config validation fails before network writes.
 
@@ -248,6 +248,8 @@ When copying is approved, all files keep their complete upstream relative path b
 
 No staging package is copied for RBAC. `k8s.io/apiserver` downloads a roughly 2.83 MB zip once and compiles only 6 of its 246 packages. Copying the closure would trade one module for ownership of the same 2,052 lines while breaking real `authorizer` type identity, request context keys, feature gates, registry behavior, CVE module identity, and tested staging version coherence. `docs/decisions/0001-no-staging-copy-rbac.md` records this decision, and a policy fixture must hard fail this copy proposal.
 
+> **Follow-on**: The approved supplemental plan [`plans/github-token-unattended.md`](github-token-unattended.md) supersedes this decision only for pure component-helper validation packages that carry no API types and whose copy delivers measured module removal. Copying `k8s.io/apiserver` itself remains prohibited in external compatibility mode because external type identity is the load-bearing property.
+
 ### 6. Relocation, rewriting, and license notices
 
 Kubernetes packages retain their full relative paths below `internal/kk`. This is a hard invariant because nested `internal` path elements use the last such element to enforce visibility.
@@ -301,7 +303,7 @@ The initial facade exports `New`, `RBACAuthorizer`, the four validation getter a
 Each replay profile hash covers normalized output-affecting config, exact prune and deny entries, patch bytes and selectors, staging copy decisions, type policy decisions, engine version, and formatting toolchain. Observational limits and goldens gate publication but do not enter the profile hash because they do not alter output bytes.
 
 1. Preserve upstream author name, email, date, message, and relevant parent relationships.
-2. Set the GitHub App bot as committer and use the upstream committer date for reproducibility.
+2. Set the `github-actions[bot]` identity as committer and use the upstream committer date for reproducibility.
 3. Append exactly one `Kubernetes-commit: <sha>` trailer and force commit signing off.
 4. Map an unchanged transformed tree to its nearest destination parent without creating a commit.
 5. Deduplicate mapped merge parents and preserve a merge when a side parent contains generated changes. Port and test publishing-bot first-parent, merge-point, and source-to-destination algorithms rather than its shell engine.
@@ -325,20 +327,20 @@ Create a deterministic annotated destination tag. It maps `v1.X.Y[-pre]` to `v0.
 
 ## GitHub automation and security
 
-### GitHub App
+### Publishing credential
 
-`tools/internal/ghapp` mints short-lived RS256 installation tokens in Go. Credentials reach Git through process environment configuration, never command arguments or remote URLs. Exact secret values seed a redacting writer before any subprocess starts.
+Publishing uses the built-in `GITHUB_TOKEN` that GitHub Actions provides to every workflow run. The token is scoped to the repository, expires when the job ends, and requires no external secret management. Credentials reach Git through process environment configuration, never command arguments or remote URLs. Exact secret values seed a redacting writer before any subprocess starts.
 
-The App is installed only on repositories it must write. It is never installed on `kubernetes/kubernetes`, so replayed issue-closing text cannot act upstream. Pull request workflows never receive App credentials. Publishing runs only from the protected default branch through `schedule` or explicitly authorized `workflow_dispatch`. `pull_request_target` is prohibited.
+The workflow token is scoped to the repository it runs in. It cannot reach `kubernetes/kubernetes`, so replayed issue-closing text cannot act upstream. Pull request workflows never receive write credentials. Publishing runs only from the protected default branch through `schedule` or explicitly authorized `workflow_dispatch`. `pull_request_target` is prohibited.
 
-Initial App setup is a one-time browser step documented in `docs/github-app.md`. Template secrets are not copied, so `soapbox setup` validates required repository secrets and refuses to enable publishing until they exist.
+Token setup is automatic: `sync.yml` passes `${{ github.token }}` as `SOAPBOX_GITHUB_TOKEN`. See `docs/github-token.md`.
 
 ### Workflows
 
 All actions are pinned to full commit SHAs and use least privilege workflow permissions.
 
-1. `ci.yml` runs the local nested tool shim in read-only verification mode and never sees App secrets.
-2. `sync.yml` runs at an off minute, supports manual dispatch, has one non-cancelling concurrency group, and contains only one single-line Go invocation for maintained logic.
+1. `ci.yml` runs the local nested tool shim in read-only verification mode and never receives write credentials.
+2. `sync.yml` runs at an off minute, supports manual dispatch, has one non-cancelling concurrency group, and contains only one single-line Go invocation for maintained logic. The job holds `contents: write` and `actions: read`. Automatic publication mode adds `-unattended`.
 3. Failure artifacts contain conflict and gate reports after secret redaction.
 4. The state ref records observed upstream heads and provides low-noise repository activity. Each successful run also checks that the workflow remains enabled. The 60-day public schedule behavior remains a monitored platform risk because GitHub does not precisely define qualifying activity.
 
@@ -375,11 +377,11 @@ Implement `treebuild` and `replay`. Exercise linear history, relevant and irrele
 
 ### Phase 5: Authenticated append-only publishing
 
-Implement `ghapp`, `ghapi`, `state`, `publish`, `report`, and token renewal. Use local bare remotes for normal tests. Assert tag moves, non-fast-forward branches, force refspecs, partial gate failures, expired tokens, and secret leakage all fail closed.
+Implement `ghapi`, `state`, `publish`, `report`, and token-based authentication. Use local bare remotes for normal tests. Assert tag moves, non-fast-forward branches, force refspecs, partial gate failures, and secret leakage all fail closed.
 
 ### Phase 6: Template setup and documentation
 
-Implement the setup allowlist transformation from copied engine to pinned nested shim, generated `ci.yml` and `sync.yml`, template self-test, configuration reference, replay and determinism rationale, type and dependency policies, behavior changes, GitHub App guide, vanity guide, and conflict runbook. Mark `enj/soapbox` as a GitHub template only at the outward-action gate.
+Implement the setup allowlist transformation from copied engine to pinned nested shim, generated `ci.yml` and `sync.yml`, template self-test, configuration reference, replay and determinism rationale, type and dependency policies, behavior changes, publishing token guide, vanity guide, and conflict runbook. Mark `enj/soapbox` as a GitHub template only at the outward-action gate.
 
 ### Phase 7: Real upstream dry run and technical spikes
 
@@ -400,7 +402,7 @@ Present one manifest containing:
 
 1. Creation and initial push of `enj/soapbox`.
 2. Creation of `enj/rbac_authorizer` from the template.
-3. GitHub App repository scope and secret names.
+3. Workflow permissions and publishing token configuration.
 4. Exact vanity page diff in `enj/enj.github.io`.
 5. Every destination branch, commit OID, annotated tag OID, and source SHA.
 6. The prune manifest, documented behavior changes, dependency policy decision, facade API, and interface assertions.

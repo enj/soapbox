@@ -6,23 +6,16 @@ module instead.
 
 The default answer is no. A large module is not by itself a reason to copy code.
 
-## Copying is refused today
+## Copying is implemented
 
-Two refusals stand between a profile and a copied package, and both are
-unconditional:
+The staging copy materializer reads approved packages from the module cache,
+relocates them under the internal prefix preserving their full upstream path,
+rewrites imports in both copied and retained files, re-tidies the module, and
+verifies the post-copy module still type checks.
 
-```text
-the profile proposes N staging package copies, and materializing a copied
-package is not implemented
-
-the decision approves N staging copies, and materializing a copied package is
-not implemented
-```
-
-The first fires on the profile before the policy runs; the second fires after
-the policy runs, if the decision approved anything. The policy itself is fully
-implemented and is what the rest of this document describes. It decides; it does
-not yet materialize.
+The `copy-approved` policy requires every correctness gate enabled and every
+cost gate answered with a non-zero ceiling (or a floor with a non-zero minimum).
+An unmeasured gate is refused, not scored as zero.
 
 ## When a copy is allowed
 
@@ -103,12 +96,64 @@ preserves nested Go `internal` restrictions. Provenance records the original
 module path, version, source SHA, licence, patent files, and the override that
 admitted it.
 
-## The RBAC decision
+## The RBAC dependency decisions
 
-No staging package is copied. The decision is recorded in
-[decisions/0001-no-staging-copy-rbac.md](decisions/0001-no-staging-copy-rbac.md)
-and a policy fixture hard-fails the proposal, with overrides applied to every
-relaxable gate, so the refusal cannot be weakened by tuning numbers.
+### k8s.io/component-helpers: one package copied, module forbidden
+
+The package `k8s.io/component-helpers/auth/rbac/validation` is a pure leaf
+utility: it imports only `k8s.io/api/rbac/v1` and the standard library, owns
+no types crossing the public boundary, registers no global state, and creates
+no diamond. Copying it removes the `k8s.io/component-helpers` module from the
+build entirely. The module is then added to `forbiddenModules` so it cannot
+re-enter through any path.
+
+The v1.36.1 certification measured one 173-line Go file, zero generated or
+native files, one Apache-2.0 grant, a 132,582-byte module zip, and eight v0.36
+releases through the v0.36.1 cutoff. The consumer module graph loses exactly
+`k8s.io/component-helpers`; the compiled dependency-package count stays 413
+because the local copy replaces the external package one-for-one. Two expiring
+v1.36 overrides are explicit: `securityCritical` accepts ownership of this RBAC
+comparison code under release-bounded regeneration and differential testing,
+and `minimumLeverage` accepts a zero line-removal reading from `go/packages`
+while the separately measured module and package removals are both one.
+
+The checked-in differential test template compares upstream and copied `Covers`
+over focused wildcard, subresource, resource-name, and non-resource URL cases
+plus 10,000 deterministic randomized rule pairs. It passed against the exact
+v0.36.1 upstream module and the generated copy.
+
+Forbidden module enforcement is five layers deep: raw Go imports in all
+retained and copied files (module-boundary exact match, not prefix), parsed
+go.mod requirements, parsed go.sum entries, `go list -m all` (indirect
+dependencies included, errors fatal), and typed module graph identities.
+
+This supersedes the original zero-copy decision recorded in
+[decisions/0001-no-staging-copy-rbac.md](decisions/0001-no-staging-copy-rbac.md),
+which was correct at the time: the materializer did not exist. Now that it
+does, and the component-helpers package passes every gate, the copy delivers
+real module removal with no correctness cost.
+
+### k8s.io/apiserver: mode-dependent identity
+
+Copying `k8s.io/apiserver` remains prohibited in both modes. Under
+`compatibility.apiserver: external`, the generated module preserves real
+apiserver user, attribute, decision, rule-info, and authorizer identities. The
+facade's external interface assertions feed `IdentityRequired`, so dependency
+policy keeps the module through the diamond gate.
+
+Under `compatibility.apiserver: local`, compatibility transformation runs before
+module and dependency policy. It generates only the declarations retained RBAC
+code reads, rewrites those imports, replaces external assertions with local
+ones, and changes `ConfirmNoEscalation` to explicit user and namespace inputs.
+The profile then forbids `k8s.io/apiserver`; the same five-layer check used for
+component-helpers proves it is absent from the published build. This is an
+intentional API break rather than a claim that copied interfaces preserve Go
+type identity.
+
+The v1.36.1 control pair dropped the loaded module count from 138 in external
+mode to 66 in local mode and the compiled dependency-package count from 413 to
+335. Full mode semantics, behavior tests, and measurements are in
+[apiserver-compatibility.md](apiserver-compatibility.md).
 
 ## Public API type preference
 
@@ -153,14 +198,16 @@ provisional module has to exist first.
    through a `refs/tags/` ref rather than a branch, and the module was not
    answered as the main module, through a replacement, or at a non-canonical
    version.
-3. Between tags, the source commit maps to each staging repository through
-   `Kubernetes-commit` trailers and the Go toolchain resolves the mapped commit
-   to a pseudo-version. No pseudo-version is ever constructed by hand. This path
-   is implemented and tested but no pipeline calls it, because branch refs are
-   refused earlier.
-4. Mappings are cached in a version index keyed by source commit. Saving merges
-   rather than overwrites, and refuses a merge where a stored entry and a new one
-   disagree about the same source commit.
+3. Between tags, an engine-selected exact source commit maps to each canonical
+   staging repository through `Kubernetes-commit` trailers. Both source and
+   staging walks are bounded inclusively by the last published release and the
+   pending release. The Go toolchain resolves each mapped commit to a
+   pseudo-version; no pseudo-version is ever constructed by hand.
+4. Mappings are cached in an append-only index keyed by source commit. Every
+   checkpoint stores the canonical index as a blob reachable from the state
+   commit and records its digest, object name, and entry count. Resume restores
+   those exact bytes before resolving more commits; conflicting entries and
+   unreachable evidence are refused.
 5. The generated `go.mod` is verified by tidying it in a scratch directory: no
    requirement may be raised by minimal version selection, none may be added,
    the module path and the `go`, `toolchain`, and `godebug` directives must be

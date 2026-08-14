@@ -161,15 +161,38 @@ generated module contains neither the generators nor the build harness the
 command names. A directive that appears after code on the same line is left
 alone; only a directive that owns its line is removed.
 
+### The change: local apiserver compatibility
+
+`compatibility.apiserver: local` deliberately changes the boundary rather than
+pretending a copied declaration has the identity of an apiserver declaration.
+The generated user, authorization, decision, and rule-info types are
+module-local and are not assignable to `k8s.io/apiserver` types. Facade exports
+and compile-time assertions point at those local declarations.
+
+The mode also removes dependence on apiserver's private request-context keys.
+`ConfirmNoEscalation` receives the authenticated user and namespace explicitly;
+it does not call `request.UserFrom` or `request.NamespaceFrom`, and Soapbox does
+not reproduce incompatible private context keys. The incompatible
+internal-version adapter is pruned.
+
+Both changes are engine-derived provenance records whose cause is
+`compatibility.apiserver: local`, so they appear in the JSON report and
+`NOTICE` without an author-maintained behavior list. The checked-in local and
+external certification tests apply the same authorization, rule-resolution,
+subject-location, service-account, and escalation cases to the two generated
+control trees. See [apiserver-compatibility.md](apiserver-compatibility.md).
+
 ## What is not a behavior change
 
 Relocation is not. Import rewriting is not. Both preserve the semantics of the
 code, and the per-file notice records them as modifications rather than as
 behaviour changes.
 
-The facade is not, either. It aliases internal types and interfaces so a
-caller's implementation satisfies the copied contract, and forwards functions
-with real declarations. External module types keep their upstream identity and
-are referenced directly, so an assertion that the generated `RBACAuthorizer`
-implements `k8s.io/apiserver/pkg/authorization/authorizer.Authorizer` is a
-statement about the real interface rather than a copy of it.
+The facade itself is not, either. It aliases internal types and interfaces so a
+caller's implementation satisfies the selected contract, and forwards functions
+with real declarations. In external mode, external module types keep their
+upstream identity and an assertion against
+`k8s.io/apiserver/pkg/authorization/authorizer.Authorizer` is about the real
+interface. In local mode, the assertion names the generated local interface and
+the identity break is recorded by the compatibility change above, not hidden by
+the facade.
