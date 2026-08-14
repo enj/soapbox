@@ -131,10 +131,12 @@ If upgrading from a schema v1 profile that used a GitHub App:
    plan-only result.
 5. Repeat upgrade with the final target profile, changing publication to
    `automatic`, and publish that separately approved fast-forward commit.
-6. Dispatch the automatic workflow at the fixed point. Verify that the
-   GITHUB_TOKEN path ran and every consumer, state, and progress ref remained at
-   its expected OID. App credentials stay until this replacement has been
-   live-verified under the outward-action manifest.
+6. Dispatch the automatic workflow at the fixed point. An automatic fixed-point
+   run sends the unchanged consumer branch through an atomic, leased no-op push;
+   `writeVerified: true` therefore proves the job-scoped GITHUB_TOKEN reached
+   receive-pack with write access while every consumer, state, and progress ref
+   remained at its expected OID. App credentials stay until this replacement
+   has been live-verified under the outward-action manifest.
 7. App secret removal, installation/App deletion, and local key removal belong
    in that same fresh outward-action manifest rather than a manual side step.
 

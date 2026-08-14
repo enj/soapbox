@@ -52,11 +52,15 @@ type ReconcileAction struct {
 
 // ReconcileResult is the machine-stable report for one workflow invocation.
 type ReconcileResult struct {
-	Schema             int               `json:"schema"`
-	FixedPoint         bool              `json:"fixedPoint"`
-	BudgetExhausted    bool              `json:"budgetExhausted"`
-	NeedsConfiguration bool              `json:"needsConfiguration"`
-	Actions            []ReconcileAction `json:"actions"`
+	Schema             int  `json:"schema"`
+	FixedPoint         bool `json:"fixedPoint"`
+	BudgetExhausted    bool `json:"budgetExhausted"`
+	NeedsConfiguration bool `json:"needsConfiguration"`
+	// WriteVerified reports that an automatic fixed-point run completed a
+	// leased no-op push through the destination credential. No ref moved; the
+	// receive-pack handshake proves the token still has write access.
+	WriteVerified bool              `json:"writeVerified"`
+	Actions       []ReconcileAction `json:"actions"`
 }
 
 func (r ReconcileResult) JSON() ([]byte, error) {
@@ -94,6 +98,9 @@ func (r ReconcileResult) Text() string {
 		b.WriteString("  checkpoint: workflow budget reserved for clean exit\n")
 	case r.NeedsConfiguration:
 		b.WriteString("  configuration: persist the resolved source anchor before automatic publication\n")
+	}
+	if r.WriteVerified {
+		b.WriteString("  write access: leased no-op push verified\n")
 	}
 	return b.String()
 }
@@ -169,6 +176,12 @@ func Reconcile(ctx context.Context, opts ReconcileOptions) (*ReconcileResult, er
 
 		if discovery.FixedPoint() {
 			report.FixedPoint = true
+			if opts.Automatic {
+				if err := verifyFixedPointWrite(ctx, opts, discovery); err != nil {
+					return report, err
+				}
+				report.WriteVerified = true
+			}
 			return report, nil
 		}
 		if len(discovery.Pending) == 0 {
@@ -286,6 +299,42 @@ func Reconcile(ctx context.Context, opts ReconcileOptions) (*ReconcileResult, er
 			return report, nil
 		}
 	}
+}
+
+// verifyFixedPointWrite performs an atomic, leased no-op push of the consumer
+// branch through the trusted destination runner. The ref cannot move because
+// NewObject and ExpectedOld are identical; reaching receive-pack proves the
+// job-scoped credential still has write access before an external credential is
+// decommissioned or a later release needs a real push.
+func verifyFixedPointWrite(ctx context.Context, opts ReconcileOptions, discovery *Discovery) error {
+	ref := "refs/heads/" + opts.Config.Destination.Branch
+	object := discovery.Observed[ref]
+	if object == "" {
+		return fmt.Errorf("reconciliation: fixed-point write verification: %s was not observed", ref)
+	}
+	publisher, _, err := publisherForDestination(ctx, opts.Destination.Git, opts.Destination, opts.Config, discovery.Format)
+	if err != nil {
+		return fmt.Errorf("reconciliation: fixed-point write verification: %w", err)
+	}
+	plan, err := publisher.Plan(ctx, []publish.Update{{
+		Ref: ref, Kind: publish.KindBranch,
+		NewObject: object, ExpectedOld: object,
+		Evidence: "automatic fixed-point write verification",
+	}})
+	if err != nil {
+		return fmt.Errorf("reconciliation: fixed-point write verification: %w", err)
+	}
+	result, err := publisher.Apply(ctx, plan, publish.ApplyOptions{
+		Approval: plan.Manifest.Hash,
+		Scope:    publish.ScopeReconcile,
+	})
+	if err != nil {
+		return fmt.Errorf("reconciliation: fixed-point write verification: %w", err)
+	}
+	if !result.Verified || len(result.Pushed) != 1 || result.Pushed[0] != ref {
+		return fmt.Errorf("reconciliation: fixed-point write verification: push result verified=%t refs=%v", result.Verified, result.Pushed)
+	}
+	return nil
 }
 
 func checkReconcileOptions(opts ReconcileOptions) error {

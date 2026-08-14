@@ -43,6 +43,25 @@ func TestReconcileResultRenderingIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestReconcileResultReportsFixedPointWriteVerification(t *testing.T) {
+	t.Parallel()
+
+	result := ReconcileResult{
+		Schema: ReconcileSchema, FixedPoint: true, WriteVerified: true,
+		Actions: []ReconcileAction{},
+	}
+	encoded, err := result.JSON()
+	if err != nil {
+		t.Fatalf("render JSON: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"writeVerified": true`) {
+		t.Errorf("JSON does not report write verification:\n%s", encoded)
+	}
+	if !strings.Contains(result.Text(), "leased no-op push verified") {
+		t.Errorf("text does not report write verification:\n%s", result.Text())
+	}
+}
+
 func TestCheckReconcileOptions(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()

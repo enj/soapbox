@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1545,6 +1546,7 @@ func TestPlanChunkCheckpointsResumesAndGraftsEpoch(t *testing.T) {
 	e.opts.Config.Source.Refs.AnchorCommit = e.upstream.commit
 	reconcileDestination := destinationConfig
 	reconcileDestination.Identity = "github.com/" + e.opts.Config.Destination.Repository
+	beforeFixed := remoteRefMap(ctx, t, destination.Git, remotePath, format.HexLength())
 	fixed, err := enginesync.Reconcile(ctx, enginesync.ReconcileOptions{
 		Config: e.opts.Config, SourceCache: cache,
 		LocalGit:    destination.Git.Anonymous().WithNoLazyFetch(),
@@ -1553,8 +1555,12 @@ func TestPlanChunkCheckpointsResumesAndGraftsEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile fixed point: %v", err)
 	}
-	if !fixed.FixedPoint || len(fixed.Actions) != 0 {
-		t.Errorf("fixed reconciliation = %#v, want no actions", fixed)
+	if !fixed.FixedPoint || !fixed.WriteVerified || len(fixed.Actions) != 0 {
+		t.Errorf("fixed reconciliation = %#v, want no actions and verified write access", fixed)
+	}
+	afterFixed := remoteRefMap(ctx, t, destination.Git, remotePath, format.HexLength())
+	if !maps.Equal(beforeFixed, afterFixed) {
+		t.Errorf("fixed-point write verification moved refs: before %#v, after %#v", beforeFixed, afterFixed)
 	}
 }
 
