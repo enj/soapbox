@@ -37,6 +37,7 @@ import (
 
 	"github.com/enj/soapbox/tools/internal/config"
 	"github.com/enj/soapbox/tools/internal/gitcli"
+	"github.com/enj/soapbox/tools/internal/gitgraph"
 	"github.com/enj/soapbox/tools/internal/relocate"
 	"github.com/enj/soapbox/tools/internal/rewrite"
 )
@@ -69,6 +70,10 @@ const (
 	// RefBranch selects a tracked upstream branch, which is how an operator
 	// inspects what the next release would contain.
 	RefBranch RefKind = "branch"
+	// RefCommit selects an exact object already present in the source cache. It
+	// is engine-only: CLI users select reviewed tags or tracked branches, while
+	// reconciliation uses this kind for commits inside a release-bounded DAG.
+	RefCommit RefKind = "commit"
 )
 
 // Ref is the single upstream ref a plan covers.
@@ -225,8 +230,15 @@ func (o *Options) validate() error {
 	}
 	switch o.Ref.Kind {
 	case RefTag, RefBranch:
+	case RefCommit:
+		if err := gitgraph.ValidateSHA(o.Ref.Name); err != nil {
+			return fmt.Errorf("plan: exact source commit: %w", err)
+		}
+		if o.Fetch {
+			return errors.New("plan: an exact source commit must already be present in the cache, so it cannot be fetched by object name")
+		}
 	default:
-		return fmt.Errorf("plan: ref kind %q must be %s or %s", o.Ref.Kind, RefTag, RefBranch)
+		return fmt.Errorf("plan: ref kind %q must be %s, %s, or %s", o.Ref.Kind, RefTag, RefBranch, RefCommit)
 	}
 	if o.Ref.Name == "" {
 		return fmt.Errorf("plan: a source %s name is required", o.Ref.Kind)
@@ -293,7 +305,7 @@ func (o Options) CheckPaths() error {
 // subprocess, and that is the guarantee that matters for the source host. This
 // check is about the operator rather than the subprocess: a plan is the command
 // people run to see what would happen, and running it on a machine that is
-// holding the App's private key is a sign that the read-only command is being
+// holding a publishing token is a sign that the read-only command is being
 // used where the publishing one was meant. Refusing costs nothing, because the
 // plan has no use for a credential at all.
 func (o *Options) checkCredentialEnvironment() error {
@@ -303,9 +315,7 @@ func (o *Options) checkCredentialEnvironment() error {
 	}
 	var present []string
 	for _, name := range []string{
-		o.Config.GitHubApp.AppIDEnv,
-		o.Config.GitHubApp.InstallationIDEnv,
-		o.Config.GitHubApp.PrivateKeyEnv,
+		"SOAPBOX_GITHUB_TOKEN",
 	} {
 		if name == "" {
 			continue

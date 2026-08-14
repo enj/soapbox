@@ -274,6 +274,13 @@ func (g *Graph) ImportPaths() []string {
 	return paths
 }
 
+// Packages reports every loaded package in sorted order.
+//
+// The caller must not modify the returned slice or the packages it contains.
+func (g *Graph) Packages() []*packages.Package {
+	return g.ordered
+}
+
 // lookup reports the package loaded at an import path.
 func (g *Graph) lookup(importPath string) (*packages.Package, bool) {
 	pkg, ok := g.byPath[importPath]

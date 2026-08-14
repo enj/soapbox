@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
+	"github.com/enj/soapbox/tools/internal/extract"
 	"github.com/enj/soapbox/tools/internal/gitcli"
 	"github.com/enj/soapbox/tools/internal/gomodmap"
 	"github.com/enj/soapbox/tools/internal/provenance"
@@ -38,7 +40,10 @@ func (r *run) runProvenance(ctx context.Context) error {
 	if err != nil {
 		return policyError(stageProvenance, err)
 	}
-	options := r.provenanceOptions(license, notice, mappings)
+	options, err := r.provenanceOptions(license, notice, mappings)
+	if err != nil {
+		return policyError(stageProvenance, err)
+	}
 
 	// The behaviour disclosure is checked before anything is composed. A profile
 	// that ran the type policy, acted on its decision, and then rendered a
@@ -52,6 +57,12 @@ func (r *run) runProvenance(ctx context.Context) error {
 	if err != nil {
 		return classify(stageProvenance, err, provenanceSemantic...)
 	}
+	copiedGrants, err := copiedLicenseFiles(options.Copied)
+	if err != nil {
+		return policyError(stageProvenance, err)
+	}
+	files = append(files, copiedGrants...)
+	slices.SortFunc(files, func(a, b relocate.File) int { return strings.Compare(a.Path, b.Path) })
 
 	// Composition validates the tree rather than writing it, so a rejection is a
 	// statement about the files the phases produced.
@@ -145,7 +156,13 @@ func (r *run) readGrants(ctx context.Context) (license, notice []byte, err error
 // requires; the behaviour changes come from the type policy analysis, so a
 // disclosure cannot be forgotten; and the public API comes from the facade
 // manifest, so the README cannot describe an API the module does not have.
-func (r *run) provenanceOptions(license, notice []byte, mappings []provenance.ModuleMapping) provenance.Options {
+func (r *run) provenanceOptions(license, notice []byte, mappings []provenance.ModuleMapping) (provenance.Options, error) {
+	copied, err := r.copiedPackages()
+	if err != nil {
+		return provenance.Options{}, fmt.Errorf("provenance: %w", err)
+	}
+	behaviorChanges := provenance.BehaviorChangesFrom(r.types)
+	behaviorChanges = append(behaviorChanges, r.compatibilityChanges...)
 	return provenance.Options{
 		Module:          r.cfg.Destination.Module,
 		RootPackage:     r.cfg.Destination.RootPackage,
@@ -158,9 +175,10 @@ func (r *run) provenanceOptions(license, notice []byte, mappings []provenance.Mo
 		UpstreamNotice:  notice,
 		Packages:        r.post.Provenance,
 		Modules:         slices.Clone(mappings),
-		BehaviorChanges: provenance.BehaviorChangesFrom(r.types),
+		Copied:          copied,
+		BehaviorChanges: behaviorChanges,
 		PublicAPI:       r.publicAPI(),
-	}
+	}, nil
 }
 
 // provenanceSource identifies the upstream commit the module was extracted from.
@@ -171,12 +189,16 @@ func (r *run) provenanceSource() provenance.Source {
 		packages = append(packages, pkg.SourcePackage)
 	}
 	slices.Sort(packages)
+	tag := ""
+	if source.RefKind == string(extract.RefTag) {
+		tag = source.RefName
+	}
 	return provenance.Source{
 		Repository: r.cfg.Source.Repository,
 		Module:     r.cfg.Source.ImportPrefix,
 		Project:    r.cfg.Source.Project,
 		SHA:        source.Commit,
-		Tag:        source.RefName,
+		Tag:        tag,
 		Packages:   slices.Compact(packages),
 	}
 }
@@ -235,6 +257,103 @@ func (r *run) publicAPI() []string {
 	return names
 }
 
+// copiedPackages builds the CopiedPackage entries the NOTICE renders.
+//
+// Each copied package records the staging module it came from, the validated
+// Origin URL and commit, the licence files collected for it, and its
+// destination in the generated tree. CopiedPackage.Package is the import path
+// (module path + module-relative package), not the staging or destination path.
+func (r *run) copiedPackages() ([]provenance.CopiedPackage, error) {
+	if len(r.copyEvidence) == 0 {
+		return nil, nil
+	}
+	var copied []provenance.CopiedPackage
+	for _, pkg := range r.copyFiles.Packages {
+		ev, err := evidenceForPackage(r.copyEvidence, pkg)
+		if err != nil {
+			return nil, fmt.Errorf("copied package %s: %w", pkg.Path, err)
+		}
+		// Derive the import path from the destination prefix. evidenceForPackage
+		// already proved the destination is either the module root or beneath it.
+		moduleRelPkg := ""
+		if pkg.Path != ev.DestinationPrefix {
+			var ok bool
+			moduleRelPkg, ok = strings.CutPrefix(pkg.Path, ev.DestinationPrefix+"/")
+			if !ok || moduleRelPkg == "" {
+				return nil, fmt.Errorf("copied package %s is outside destination prefix %s", pkg.Path, ev.DestinationPrefix)
+			}
+		}
+		expectedSource := moduleRelPkg
+		if expectedSource == "" {
+			expectedSource = "."
+		}
+		if pkg.Source != expectedSource {
+			return nil, fmt.Errorf("copied package %s records source %q, want module-relative %q", pkg.Path, pkg.Source, expectedSource)
+		}
+		importPath := ev.ModulePath
+		if moduleRelPkg != "" {
+			importPath = ev.ModulePath + "/" + moduleRelPkg
+		}
+		// Deep-clone the license records so a caller cannot mutate evidence.
+		licenses := make([]provenance.LicenseFile, len(ev.Licenses))
+		for i, lf := range ev.Licenses {
+			licenses[i] = provenance.LicenseFile{
+				Name:        lf.Name,
+				SourcePath:  lf.SourcePath,
+				Destination: lf.Destination,
+				Contents:    slices.Clone(lf.Contents),
+				SHA256:      lf.SHA256,
+			}
+		}
+		copied = append(copied, provenance.CopiedPackage{
+			Module:           ev.ModulePath,
+			Version:          ev.Version,
+			Package:          importPath,
+			Destination:      pkg.Path,
+			SourceRepository: ev.OriginURL,
+			SourceSHA:        ev.OriginHash,
+			LicenseID:        r.cfg.Source.License,
+			Licenses:         licenses,
+		})
+	}
+	return copied, nil
+}
+
+// copiedLicenseFiles returns the licence, notice, and patent documents that
+// travel with copied dependency packages. Multiple copied packages in one
+// module commonly name the same module-root grant, so identical destinations
+// are deduplicated; contradictory records fail instead of making composition
+// order decide which legal text is published.
+func copiedLicenseFiles(copied []provenance.CopiedPackage) ([]relocate.File, error) {
+	byDestination := make(map[string]provenance.LicenseFile)
+	for _, pkg := range copied {
+		for _, license := range pkg.Licenses {
+			previous, exists := byDestination[license.Destination]
+			if exists {
+				if previous.Name != license.Name ||
+					previous.SourcePath != license.SourcePath ||
+					previous.SHA256 != license.SHA256 ||
+					!slices.Equal(previous.Contents, license.Contents) {
+					return nil, fmt.Errorf("copied licence destination %q has contradictory records", license.Destination)
+				}
+				continue
+			}
+			byDestination[license.Destination] = license
+		}
+	}
+
+	paths := make([]string, 0, len(byDestination))
+	for destination := range byDestination {
+		paths = append(paths, destination)
+	}
+	slices.Sort(paths)
+	files := make([]relocate.File, 0, len(paths))
+	for _, destination := range paths {
+		files = append(files, byDestination[destination].File())
+	}
+	return files, nil
+}
+
 // compose assembles the complete generated module.
 //
 // Four things go in, and they go in through one write boundary rather than four:
@@ -246,6 +365,12 @@ func (r *run) compose(provenanceFiles []relocate.File) (relocate.FileSet, error)
 	set, err := r.post.Files.With(r.facadeFiles()...)
 	if err != nil {
 		return relocate.FileSet{}, fmt.Errorf("facade: %w", err)
+	}
+	if len(r.copyFiles.Files) > 0 {
+		set, err = set.With(r.copyFiles.Files...)
+		if err != nil {
+			return relocate.FileSet{}, fmt.Errorf("staging copies: %w", err)
+		}
 	}
 	set, err = set.With(r.metadataFiles()...)
 	if err != nil {

@@ -49,15 +49,26 @@ type Ancestry interface {
 //
 // The ancestry checker is consulted only where the answer could differ, so a
 // merge that advanced nothing asks the repository nothing.
+// Merge uses one ancestry graph for both source and destination positions. It is
+// retained for callers whose fixture or repository contains both histories.
 func Merge(ctx context.Context, prev, next Document, ancestry Ancestry) (Document, error) {
+	return MergeWith(ctx, prev, next, ancestry, ancestry)
+}
+
+// MergeWith checks source and destination advances against their respective
+// repositories. Soapbox's source cache and generated destination never share an
+// object database, so conflating these graphs would make a valid cursor or epoch
+// advance fail with a missing-object error.
+
+func MergeWith(ctx context.Context, prev, next Document, sourceAncestry, destinationAncestry Ancestry) (Document, error) {
 	// The check is at the top rather than left to the first ancestry call,
 	// because a merge that happens to need no ancestry call would otherwise
 	// accept a successor after its caller had already given up on the work.
 	if err := ctx.Err(); err != nil {
 		return Document{}, fmt.Errorf("merge state: %w", err)
 	}
-	if ancestry == nil {
-		return Document{}, errors.New("merge state: an ancestry checker is required")
+	if sourceAncestry == nil || destinationAncestry == nil {
+		return Document{}, errors.New("merge state: source and destination ancestry checkers are required")
 	}
 	if err := prev.Validate(); err != nil {
 		return Document{}, fmt.Errorf("merge state: previous document: %w", err)
@@ -86,7 +97,7 @@ func Merge(ctx context.Context, prev, next Document, ancestry Ancestry) (Documen
 		return Document{}, err
 	}
 
-	m := merger{ancestry: ancestry, sameEpoch: prev.Epoch.Profile == candidate.Epoch.Profile}
+	m := merger{source: sourceAncestry, destination: destinationAncestry, sameEpoch: prev.Epoch.Profile == candidate.Epoch.Profile}
 	if err := m.epoch(ctx, prev.Epoch, candidate.Epoch); err != nil {
 		return Document{}, err
 	}
@@ -124,7 +135,8 @@ func canonical(doc Document) (Document, error) {
 // merger carries the two things every rule below needs: who answers ancestry
 // questions, and whether the destination history was re-derived.
 type merger struct {
-	ancestry Ancestry
+	source      Ancestry
+	destination Ancestry
 	// sameEpoch reports that both documents were produced by the same output
 	// affecting profile. When it is false the destination commits in next were
 	// re-derived from scratch and grafted onto a new parent, so they are a new
@@ -146,13 +158,13 @@ func (m merger) epoch(ctx context.Context, prev, next Epoch) error {
 		}
 		return immutable("epoch destination", prev.Destination, next.Destination)
 	}
-	if err := m.descends(ctx, "epoch source", prev.Source, next.Source); err != nil {
+	if err := m.sourceDescends(ctx, "epoch source", prev.Source, next.Source); err != nil {
 		return err
 	}
 	// A new epoch grafts onto the destination history the previous one left
 	// behind, so its parent has to descend from the previous parent even though
 	// the commits between them were re-derived.
-	return m.descends(ctx, "epoch destination", prev.Destination, next.Destination)
+	return m.destinationRawDescends(ctx, "epoch destination", prev.Destination, next.Destination)
 }
 
 // cursors checks the tracked ref positions.
@@ -168,7 +180,7 @@ func (m merger) cursors(ctx context.Context, prev, next []Cursor) error {
 				ErrDropped, before.Ref, before.Source)
 		}
 		what := "cursor " + before.Ref
-		if err := m.descends(ctx, what+" source", before.Source, after.Source); err != nil {
+		if err := m.sourceDescends(ctx, what+" source", before.Source, after.Source); err != nil {
 			return err
 		}
 		if err := m.destinationDescends(ctx, what+" destination", before.Destination, after.Destination); err != nil {
@@ -255,7 +267,7 @@ func (m merger) tracks(ctx context.Context, prev, next []Track) error {
 				ErrRewind, before.Name, after.Total, before.Total)
 		}
 		what := "track " + before.Name
-		if err := m.descends(ctx, what+" source", before.Source, after.Source); err != nil {
+		if err := m.sourceDescends(ctx, what+" source", before.Source, after.Source); err != nil {
 			return err
 		}
 		if err := m.destinationDescends(ctx, what+" destination", before.Destination, after.Destination); err != nil {
@@ -314,13 +326,13 @@ func (m merger) published(ctx context.Context, prev, next []Published) error {
 		// epoch did, because the remote refuses a non fast forward push and a
 		// record claiming otherwise would have the engine plan a push that
 		// cannot land.
-		if err := m.descends(ctx, "published "+before.Ref, before.Object, after.Object); err != nil {
+		if err := m.destinationRawDescends(ctx, "published "+before.Ref, before.Object, after.Object); err != nil {
 			return err
 		}
 		// The source side advances under the ordinary rule. Unlike the
 		// destination it is never re-derived, so a profile change does not relax
 		// it: upstream history is what it is in every epoch.
-		if err := m.descends(ctx, "published "+before.Ref+" source", before.Source, after.Source); err != nil {
+		if err := m.sourceDescends(ctx, "published "+before.Ref+" source", before.Source, after.Source); err != nil {
 			return err
 		}
 	}
@@ -335,14 +347,14 @@ func (m merger) published(ctx context.Context, prev, next []Published) error {
 // learn it. An empty recorded position is a position that was never taken, so
 // the first commit recorded there is an advance from nothing rather than a move
 // that has to be justified.
-func (m merger) descends(ctx context.Context, what, from, to string) error {
+func descends(ctx context.Context, ancestry Ancestry, what, from, to string) error {
 	if from == to || from == "" {
 		return nil
 	}
 	if to == "" {
 		return fmt.Errorf("%w: %s was recorded at %s and is now empty", ErrRewind, what, from)
 	}
-	ok, err := m.ancestry.IsAncestor(ctx, from, to)
+	ok, err := ancestry.IsAncestor(ctx, from, to)
 	if err != nil {
 		return fmt.Errorf("%s: ancestry of %s and %s: %w", what, from, to, err)
 	}
@@ -352,12 +364,20 @@ func (m merger) descends(ctx context.Context, what, from, to string) error {
 	return nil
 }
 
+func (m merger) sourceDescends(ctx context.Context, what, from, to string) error {
+	return descends(ctx, m.source, what, from, to)
+}
+
+func (m merger) destinationRawDescends(ctx context.Context, what, from, to string) error {
+	return descends(ctx, m.destination, what, from, to)
+}
+
 // destinationDescends applies the descent rule only within one epoch.
 func (m merger) destinationDescends(ctx context.Context, what, from, to string) error {
 	if !m.sameEpoch {
 		return nil
 	}
-	return m.descends(ctx, what, from, to)
+	return m.destinationRawDescends(ctx, what, from, to)
 }
 
 // immutable reports a field that identifies the record and changed anyway.

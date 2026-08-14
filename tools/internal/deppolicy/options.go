@@ -258,6 +258,11 @@ type Package struct {
 	// OtherFiles are the base names of its non-Go build inputs: assembly, C,
 	// and anything else the go tool would compile.
 	OtherFiles []string
+	// IgnoredFiles are the base names of source files that belong to the
+	// package directory but were excluded by the current build constraints.
+	// A non-empty list means the loader saw files it did not build, so a
+	// copy that reads only GoFiles and OtherFiles would be host-specific.
+	IgnoredFiles []string
 	// Imports are the import paths this package imports.
 	Imports []string
 }

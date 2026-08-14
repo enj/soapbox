@@ -26,6 +26,20 @@ const KubernetesCommitTrailer = "Kubernetes-commit"
 // mainline of a release branch, so a commit that is only reachable through a
 // merge's second parent was never published on its own, and treating it as a
 // mapping candidate would name a staging commit that does not exist.
+const kubernetesStagingPrefix = "k8s.io/"
+
+// StagingRepository returns the canonical repository for a Kubernetes staging
+// module. Staging modules are one-segment k8s.io paths published from sibling
+// repositories in the kubernetes organization; refusing every other shape keeps
+// exact-commit resolution from guessing where dependency history lives.
+func StagingRepository(modulePath string) (string, error) {
+	name, ok := strings.CutPrefix(modulePath, kubernetesStagingPrefix)
+	if !ok || name == "" || strings.Contains(name, "/") {
+		return "", fmt.Errorf("staging module %q must be a one-segment path below %s", modulePath, kubernetesStagingPrefix)
+	}
+	return "https://github.com/kubernetes/" + name + ".git", nil
+}
+
 type SourceMainline struct {
 	// commits is the mainline, newest first, so a scan finds the closest
 	// ancestor before any older one.
@@ -36,6 +50,8 @@ type SourceMainline struct {
 type MainlineOptions struct {
 	// Revision is the source commit to walk back from.
 	Revision string
+	// Anchor is the oldest source commit the mapping may inspect, inclusive.
+	Anchor string
 	// MaxCount bounds the walk. Zero means the whole history.
 	//
 	// A bound is a correctness risk rather than only a performance choice: a
@@ -46,24 +62,42 @@ type MainlineOptions struct {
 	MaxCount int
 }
 
-// NewSourceMainline walks the first-parent history of one source commit.
-//
-// The walk reads object names and parent edges and nothing else. A Kubernetes
-// mainline is six figures of commits, and the batched metadata read would carry
-// every one of their messages and trailers along with it, so asking for the
-// commit graph rather than the commit log is what keeps a question about
-// ancestry from costing a full read of the history's prose.
+// NewSourceMainline walks one release-bounded first-parent source history.
+// The inclusive anchor prevents every exact generation from scanning the full
+// six-figure Kubernetes history.
 func NewSourceMainline(ctx context.Context, git *gitcli.Runner, opts MainlineOptions) (*SourceMainline, error) {
 	if opts.Revision == "" {
 		return nil, fmt.Errorf("source mainline: a revision is required")
 	}
-	commits, err := git.CommitGraph(ctx, gitcli.RevListOptions{
-		Include:     []string{opts.Revision},
-		FirstParent: true,
-		MaxCount:    opts.MaxCount,
-	})
+	revList := gitcli.RevListOptions{
+		Include: []string{opts.Revision}, FirstParent: true, MaxCount: opts.MaxCount,
+	}
+	var anchor string
+	if opts.Anchor != "" {
+		var err error
+		anchor, err = git.ResolveCommit(ctx, opts.Anchor)
+		if err != nil {
+			return nil, fmt.Errorf("source mainline anchor: %w", err)
+		}
+		revision, err := git.ResolveCommit(ctx, opts.Revision)
+		if err != nil {
+			return nil, fmt.Errorf("source mainline of %s: %w", opts.Revision, err)
+		}
+		descends, err := git.IsAncestor(ctx, anchor, revision)
+		if err != nil {
+			return nil, fmt.Errorf("source mainline of %s: anchor ancestry: %w", opts.Revision, err)
+		}
+		if !descends {
+			return nil, fmt.Errorf("source mainline of %s: revision %s does not descend from anchor %s", opts.Revision, revision, anchor)
+		}
+		revList.Exclude = []string{anchor}
+	}
+	commits, err := git.CommitGraph(ctx, revList)
 	if err != nil {
 		return nil, fmt.Errorf("source mainline of %s: %w", opts.Revision, err)
+	}
+	if anchor != "" {
+		commits = append([]gitcli.DAGCommit{{SHA: anchor}}, commits...)
 	}
 	if len(commits) == 0 {
 		return nil, fmt.Errorf("source mainline of %s: no commits", opts.Revision)
@@ -73,16 +107,8 @@ func NewSourceMainline(ctx context.Context, git *gitcli.Runner, opts MainlineOpt
 	// because the closest ancestor is the one a staging repository would have
 	// published most recently.
 	mainline := &SourceMainline{commits: make([]string, 0, len(commits))}
-	// The dedup set is transient on purpose. It exists to refuse a walk that is
-	// not a line, since Distance counts positions in this slice, and nothing
-	// afterwards needs it: Map wants the closest ancestor, which is a scan from
-	// the newest end rather than a lookup.
 	seen := make(map[string]bool, len(commits))
 	for i := len(commits) - 1; i >= 0; i-- {
-		// Every object name git printed is a window into the one string the whole
-		// response arrived in, so retaining them uncopied would hold that response
-		// alive for as long as the mainline is, which for a Kubernetes history is
-		// the thing this walk was made lean to avoid.
 		sha := strings.Clone(commits[i].SHA)
 		if seen[sha] {
 			return nil, fmt.Errorf("source mainline of %s: commit %s appears twice, which a first-parent walk does not produce", opts.Revision, sha)
@@ -90,8 +116,6 @@ func NewSourceMainline(ctx context.Context, git *gitcli.Runner, opts MainlineOpt
 		seen[sha] = true
 		mainline.commits = append(mainline.commits, sha)
 	}
-	// The head becomes the key every resolved entry is recorded under, so it is
-	// checked once here rather than left to fail later as a cache write.
 	if err := gitgraph.ValidateSHA(mainline.commits[0]); err != nil {
 		return nil, fmt.Errorf("source mainline of %s: %w", opts.Revision, err)
 	}
@@ -118,21 +142,17 @@ type IndexOptions struct {
 	// ModulePath is the staging module the repository publishes, such as
 	// k8s.io/api.
 	ModulePath string
-	// Revision is the staging branch tip to walk, such as a release branch.
+	// Revision is the staging branch tip to walk, such as a release tag.
 	Revision string
-	// MaxCount bounds the walk. Zero means the whole history.
+	// Anchor is the oldest staging commit to inspect, inclusive.
+	Anchor string
+	// MaxCount bounds the walk. Zero means the whole bounded history.
 	MaxCount int
 }
 
-// NewStagingIndex reads the source commit every staging commit claims.
-//
-// The claim is read strictly. A staging commit that carries more than one
-// Kubernetes-commit trailer is refused rather than resolved by preferring one of
-// them, because the trailer is provenance: two claims mean the commit does not
-// establish which source commit produced it, and picking either one would
-// publish a dependency pin backed by a guess. A commit carrying no claim at all
-// is skipped, because a staging repository legitimately holds commits that no
-// single source commit produced.
+// NewStagingIndex reads the source commit each release-bounded staging commit
+// claims. Multiple Kubernetes-commit trailers are ambiguous and refused; a
+// commit carrying no claim is unrelated publishing machinery and is skipped.
 func NewStagingIndex(ctx context.Context, git *gitcli.Runner, opts IndexOptions) (*StagingIndex, error) {
 	if opts.ModulePath == "" {
 		return nil, fmt.Errorf("staging index: a module path is required")
@@ -140,13 +160,39 @@ func NewStagingIndex(ctx context.Context, git *gitcli.Runner, opts IndexOptions)
 	if opts.Revision == "" {
 		return nil, fmt.Errorf("staging index for %s: a revision is required", opts.ModulePath)
 	}
-	commits, err := git.CommitLog(ctx, gitcli.CommitLogOptions{
-		Include:     []string{opts.Revision},
-		FirstParent: true,
-		MaxCount:    opts.MaxCount,
-	})
+	logOptions := gitcli.CommitLogOptions{
+		Include: []string{opts.Revision}, FirstParent: true, MaxCount: opts.MaxCount,
+	}
+	var anchor *gitcli.Commit
+	if opts.Anchor != "" {
+		anchorCommit, err := git.ResolveCommit(ctx, opts.Anchor)
+		if err != nil {
+			return nil, fmt.Errorf("staging index for %s anchor: %w", opts.ModulePath, err)
+		}
+		revision, err := git.ResolveCommit(ctx, opts.Revision)
+		if err != nil {
+			return nil, fmt.Errorf("staging index for %s: %w", opts.ModulePath, err)
+		}
+		descends, err := git.IsAncestor(ctx, anchorCommit, revision)
+		if err != nil {
+			return nil, fmt.Errorf("staging index for %s: anchor ancestry: %w", opts.ModulePath, err)
+		}
+		if !descends {
+			return nil, fmt.Errorf("staging index for %s: revision %s does not descend from anchor %s", opts.ModulePath, revision, anchorCommit)
+		}
+		metadata, err := git.CommitInfo(ctx, anchorCommit)
+		if err != nil {
+			return nil, fmt.Errorf("staging index for %s anchor: %w", opts.ModulePath, err)
+		}
+		anchor = &metadata
+		logOptions.Exclude = []string{anchorCommit}
+	}
+	commits, err := git.CommitLog(ctx, logOptions)
 	if err != nil {
 		return nil, fmt.Errorf("staging index for %s: %w", opts.ModulePath, err)
+	}
+	if anchor != nil {
+		commits = append([]gitcli.Commit{*anchor}, commits...)
 	}
 
 	index := &StagingIndex{
@@ -166,19 +212,11 @@ func NewStagingIndex(ctx context.Context, git *gitcli.Runner, opts IndexOptions)
 		default:
 			return nil, fmt.Errorf("staging index for %s: commit %s carries %d %s trailers", opts.ModulePath, commit.SHA, len(claims), KubernetesCommitTrailer)
 		}
-		// Both names are copied out of the response. They are windows into the one
-		// string every commit's metadata and message arrived in, so an index that
-		// retained them uncopied would hold the whole staging history's prose for
-		// as long as the mapping runs.
 		source := strings.Clone(claims[0])
 		if err := gitgraph.ValidateSHA(source); err != nil {
 			return nil, fmt.Errorf("staging index for %s: %s trailer of commit %s: %w", opts.ModulePath, KubernetesCommitTrailer, commit.SHA, err)
 		}
 		staging := strings.Clone(commit.SHA)
-		// The staging name becomes half of a module version query, so an
-		// abbreviated or malformed one has to be refused here rather than handed
-		// to the go command, which would resolve a prefix to whichever commit it
-		// happened to match.
 		if err := gitgraph.ValidateSHA(staging); err != nil {
 			return nil, fmt.Errorf("staging index for %s: %w", opts.ModulePath, err)
 		}

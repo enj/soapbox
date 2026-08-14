@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -41,6 +42,58 @@ type indexDocument struct {
 // through a temporary file and a rename, so a run interrupted mid-write leaves
 // the previous index intact rather than a truncated document that the next run
 // would have to decide how to interpret.
+// Encode renders an index in the canonical on-disk form used by Store.
+func Encode(index *Index) ([]byte, error) {
+	if index == nil {
+		return nil, errors.New("version index: no index to encode")
+	}
+	entries := index.Entries()
+	if entries == nil {
+		entries = []Entry{}
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(indexDocument{Schema: indexSchema, Entries: entries}); err != nil {
+		return nil, fmt.Errorf("version index: %w", err)
+	}
+	return buffer.Bytes(), nil
+}
+
+// Decode reads a complete strict index document from bytes.
+func Decode(data []byte) (*Index, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var document indexDocument
+	if err := decoder.Decode(&document); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrIndexCorrupt, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("%w: trailing content after the document", ErrIndexCorrupt)
+		}
+		return nil, fmt.Errorf("%w: trailing content after the document: %w", ErrIndexCorrupt, err)
+	}
+	if document.Schema != indexSchema {
+		return nil, fmt.Errorf("%w: schema %d is not %d", ErrIndexCorrupt, document.Schema, indexSchema)
+	}
+
+	index := NewIndex()
+	seen := make(map[string]bool, len(document.Entries))
+	for _, entry := range document.Entries {
+		if seen[entry.Source] {
+			return nil, fmt.Errorf("%w: source %s is recorded more than once", ErrIndexCorrupt, entry.Source)
+		}
+		seen[entry.Source] = true
+		if err := index.Put(entry); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrIndexCorrupt, err)
+		}
+	}
+	return index, nil
+}
+
 type Store struct {
 	path string
 }
@@ -63,6 +116,56 @@ func NewStore(path string) (*Store, error) {
 // Path reports the file backing the store.
 func (s *Store) Path() string { return s.path }
 
+// Snapshot returns the canonical bytes and validated index currently stored.
+func (s *Store) Snapshot(ctx context.Context) ([]byte, *Index, error) {
+	index, err := s.Load(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	encoded, err := Encode(index)
+	if err != nil {
+		return nil, nil, fmt.Errorf("version index %s: %w", s.path, err)
+	}
+	return encoded, index, nil
+}
+
+// Restore replaces the local cache with canonical mapping evidence fetched
+// through a state record. The remote checkpoint is authoritative; retaining
+// local entries from an interrupted future attempt would make replanning depend
+// on which runner cache happened to survive.
+func (s *Store) Restore(ctx context.Context, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("version index %s: %w", s.path, err)
+	}
+	index, err := Decode(data)
+	if err != nil {
+		return fmt.Errorf("version index %s: restore: %w", s.path, err)
+	}
+	canonical, err := Encode(index)
+	if err != nil {
+		return fmt.Errorf("version index %s: restore: %w", s.path, err)
+	}
+	if !bytes.Equal(canonical, data) {
+		return fmt.Errorf("version index %s: restore: %w: evidence is not canonical", s.path, ErrIndexCorrupt)
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o750); err != nil {
+		return fmt.Errorf("version index %s: restore: %w", s.path, err)
+	}
+	if err := writeFileAtomic(s.path, canonical); err != nil {
+		return fmt.Errorf("version index %s: restore: %w", s.path, err)
+	}
+	return nil
+}
+
+// Reset writes the canonical empty index.
+func (s *Store) Reset(ctx context.Context) error {
+	data, err := Encode(NewIndex())
+	if err != nil {
+		return fmt.Errorf("version index %s: reset: %w", s.path, err)
+	}
+	return s.Restore(ctx, data)
+}
+
 // Load reads the stored index.
 //
 // A file that does not exist reports ErrIndexMissing, which a caller treats as
@@ -81,37 +184,9 @@ func (s *Store) Load(ctx context.Context) (*Index, error) {
 		}
 		return nil, fmt.Errorf("version index %s: %w", s.path, err)
 	}
-
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var document indexDocument
-	if err := decoder.Decode(&document); err != nil {
-		return nil, fmt.Errorf("version index %s: %w: %w", s.path, ErrIndexCorrupt, err)
-	}
-	if decoder.More() {
-		return nil, fmt.Errorf("version index %s: %w: trailing content after the document", s.path, ErrIndexCorrupt)
-	}
-	if document.Schema != indexSchema {
-		return nil, fmt.Errorf("version index %s: %w: schema %d is not %d", s.path, ErrIndexCorrupt, document.Schema, indexSchema)
-	}
-
-	index := NewIndex()
-	seen := make(map[string]bool, len(document.Entries))
-	for _, entry := range document.Entries {
-		// A repeated source is a defect of the document, decided here rather than
-		// left to Put. Put tolerates an identical repeat so a resumed run can
-		// replay an answer it already holds, and it refuses a divergent one for
-		// its own reason, so leaning on it would report two shapes of the same
-		// fault and would let the identical shape through entirely. This engine
-		// writes one entry per source commit, so a stored index naming one twice
-		// was not written by it however well the copies agree.
-		if seen[entry.Source] {
-			return nil, fmt.Errorf("version index %s: %w: source %s is recorded more than once", s.path, ErrIndexCorrupt, entry.Source)
-		}
-		seen[entry.Source] = true
-		if err := index.Put(entry); err != nil {
-			return nil, fmt.Errorf("version index %s: %w: %w", s.path, ErrIndexCorrupt, err)
-		}
+	index, err := Decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("version index %s: %w", s.path, err)
 	}
 	return index, nil
 }
@@ -154,22 +229,11 @@ func (s *Store) Save(ctx context.Context, index *Index) error {
 		}
 	}
 
-	entries := merged.Entries()
-	if entries == nil {
-		entries = []Entry{}
-	}
-
-	var buffer bytes.Buffer
-	encoder := json.NewEncoder(&buffer)
-	encoder.SetIndent("", "  ")
-	// Module paths and versions are not HTML. Escaping the characters a browser
-	// would care about would rewrite them into a form that no longer matches the
-	// value that was resolved.
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(indexDocument{Schema: indexSchema, Entries: entries}); err != nil {
+	encoded, err := Encode(merged)
+	if err != nil {
 		return fmt.Errorf("version index %s: %w", s.path, err)
 	}
-	if err := writeFileAtomic(s.path, buffer.Bytes()); err != nil {
+	if err := writeFileAtomic(s.path, encoded); err != nil {
 		return fmt.Errorf("version index %s: %w", s.path, err)
 	}
 	return nil

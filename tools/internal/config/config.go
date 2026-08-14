@@ -21,29 +21,30 @@ import (
 )
 
 // SchemaVersion is the only soapbox.yaml schema version this engine accepts.
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 // DefaultFileName is the conventional profile file name in a repository root.
 const DefaultFileName = "soapbox.yaml"
 
 // Config is a complete extraction profile.
 type Config struct {
-	Version      int          `yaml:"version"`
-	Source       Source       `yaml:"source"`
-	Destination  Destination  `yaml:"destination"`
-	Packages     Packages     `yaml:"packages"`
-	Prune        Prune        `yaml:"prune"`
-	Deny         Deny         `yaml:"deny"`
-	Closure      Closure      `yaml:"closure"`
-	Types        Types        `yaml:"types"`
-	Dependencies Dependencies `yaml:"dependencies"`
-	Patches      []Patch      `yaml:"patches"`
-	Facade       Facade       `yaml:"facade"`
-	Release      Release      `yaml:"release"`
-	Commit       Commit       `yaml:"commit"`
-	Vanity       Vanity       `yaml:"vanity"`
-	GitHubApp    GitHubApp    `yaml:"githubApp"`
-	Determinism  Determinism  `yaml:"determinism"`
+	Version       int           `yaml:"version"`
+	Source        Source        `yaml:"source"`
+	Destination   Destination   `yaml:"destination"`
+	Packages      Packages      `yaml:"packages"`
+	Prune         Prune         `yaml:"prune"`
+	Deny          Deny          `yaml:"deny"`
+	Closure       Closure       `yaml:"closure"`
+	Types         Types         `yaml:"types"`
+	Dependencies  Dependencies  `yaml:"dependencies"`
+	Patches       []Patch       `yaml:"patches"`
+	Facade        Facade        `yaml:"facade"`
+	Release       Release       `yaml:"release"`
+	Commit        Commit        `yaml:"commit"`
+	Vanity        Vanity        `yaml:"vanity"`
+	Publication   Publication   `yaml:"publication"`
+	Compatibility Compatibility `yaml:"compatibility"`
+	Determinism   Determinism   `yaml:"determinism"`
 }
 
 // Source describes the upstream repository and the refs the engine tracks.
@@ -139,10 +140,11 @@ type TypePair struct {
 
 // Dependencies decides whether staging packages may be copied.
 type Dependencies struct {
-	Policy       string               `yaml:"policy"`
-	CopyPackages []string             `yaml:"copyPackages"`
-	Gates        DependencyGates      `yaml:"gates"`
-	Overrides    []DependencyOverride `yaml:"overrides"`
+	Policy           string               `yaml:"policy"`
+	CopyPackages     []string             `yaml:"copyPackages"`
+	ForbiddenModules []string             `yaml:"forbiddenModules"`
+	Gates            DependencyGates      `yaml:"gates"`
+	Overrides        []DependencyOverride `yaml:"overrides"`
 }
 
 // DependencyGates holds the non-overridable correctness gates and the cost
@@ -213,6 +215,9 @@ type Export struct {
 	Name   string `yaml:"name"`
 	Kind   string `yaml:"kind"`
 	Source string `yaml:"source"`
+	// Direct is engine-derived and never decoded. It marks a generated
+	// module-local declaration that needs no source-to-internal relocation.
+	Direct bool `yaml:"-"`
 }
 
 // Alias republishes an internal symbol under a different name, which is how
@@ -228,6 +233,9 @@ type InterfaceAssertion struct {
 	Type      string `yaml:"type"`
 	Pointer   bool   `yaml:"pointer"`
 	Interface string `yaml:"interface"`
+	// Local is engine-derived and permits an assertion against a generated
+	// module-local interface in an intentionally breaking compatibility mode.
+	Local bool `yaml:"-"`
 }
 
 // Release maps upstream release tags onto generated module tags.
@@ -260,13 +268,23 @@ type Vanity struct {
 	ProbeURL      string `yaml:"probeURL"`
 }
 
-// GitHubApp names the environment variables that carry App credentials.
-// Only names live in configuration. Values never do.
-type GitHubApp struct {
-	AppIDEnv          string `yaml:"appIDEnv"`
-	InstallationIDEnv string `yaml:"installationIDEnv"`
-	PrivateKeyEnv     string `yaml:"privateKeyEnv"`
-	APIBaseURL        string `yaml:"apiBaseURL"`
+// Publication describes how the generated module is published.
+type Publication struct {
+	// Mode is either manual or automatic. Manual mode requires an explicit
+	// workflow dispatch to publish; automatic mode adds -unattended to the sync
+	// command so a scheduled run publishes without further intervention.
+	Mode string `yaml:"mode"`
+}
+
+// Compatibility selects which apiserver environments the generated module
+// targets.
+type Compatibility struct {
+	// Apiserver is either external or local. External means the generated module
+	// depends only on published staging modules (the default for consumers that
+	// run out of tree). Local means the module may use in-tree apiserver helpers
+	// that are not published as staging modules (for testing against a locally
+	// built apiserver).
+	Apiserver string `yaml:"apiserver"`
 }
 
 // Determinism pins the formatting toolchain and the gated backfill chunk size.
@@ -367,14 +385,18 @@ func encodeYAML(value any) ([]byte, error) {
 // here, and so no slice is shared by accident.
 //
 // Everything operational is absent: where refs are published, which branches are
-// discovered, chunk sizes, GitHub App environment names, vanity locations, and
+// discovered, chunk sizes, vanity locations, publication mode, and
 // observational closure limits and goldens. Changing any of them must not start
 // a new profile epoch, because none of them changes a single generated byte.
 //
-// Dependency gates and overrides are present because they decide whether a
-// proposed staging copy becomes part of the generated tree. Changing one is a
-// control-plane change even when the current source commit happens to produce
-// the same decision; a later commit under the same epoch may cross that gate.
+// Dependency gates, overrides, and forbidden modules are present because they
+// decide whether a proposed staging copy becomes part of the generated tree.
+// Changing one is a control-plane change even when the current source commit
+// happens to produce the same decision; a later commit under the same epoch may
+// cross that gate.
+//
+// The compatibility apiserver mode is present because it decides which
+// dependencies are acceptable, which changes the generated module graph.
 //
 // The upstream project name, the licence identifier, and the destination summary
 // are present even though they are prose. They are rendered verbatim into the
@@ -401,6 +423,7 @@ type profile struct {
 	Facade         Facade       `yaml:"facade"`
 	Release        Release      `yaml:"release"`
 	Commit         Commit       `yaml:"commit"`
+	Apiserver      string       `yaml:"compatibilityApiserver"`
 	Toolchain      string       `yaml:"toolchain"`
 }
 
@@ -434,10 +457,11 @@ func (c *Config) ProfileBytes() ([]byte, error) {
 			Pairs:  slices.Clone(c.Types.Pairs),
 		},
 		DependencyPlan: Dependencies{
-			Policy:       c.Dependencies.Policy,
-			CopyPackages: slices.Clone(c.Dependencies.CopyPackages),
-			Gates:        c.Dependencies.Gates,
-			Overrides:    slices.Clone(c.Dependencies.Overrides),
+			Policy:           c.Dependencies.Policy,
+			CopyPackages:     slices.Clone(c.Dependencies.CopyPackages),
+			ForbiddenModules: slices.Clone(c.Dependencies.ForbiddenModules),
+			Gates:            c.Dependencies.Gates,
+			Overrides:        slices.Clone(c.Dependencies.Overrides),
 		},
 		Patches: clonePatches(c.Patches),
 		Facade: Facade{
@@ -450,6 +474,7 @@ func (c *Config) ProfileBytes() ([]byte, error) {
 		},
 		Release:   c.Release,
 		Commit:    c.Commit,
+		Apiserver: c.Compatibility.Apiserver,
 		Toolchain: c.Determinism.Toolchain,
 	}
 	return encodeYAML(view)
@@ -473,7 +498,6 @@ func (c *Config) normalize() {
 	c.Destination.Remote = normalizeURLHost(c.Destination.Remote)
 	c.Vanity.RepositoryURL = normalizeURLHost(c.Vanity.RepositoryURL)
 	c.Vanity.ProbeURL = normalizeURLHost(c.Vanity.ProbeURL)
-	c.GitHubApp.APIBaseURL = normalizeURLHost(c.GitHubApp.APIBaseURL)
 
 	sort.Strings(c.Source.Refs.Branches)
 	sort.Strings(c.Packages.Roots)
@@ -482,6 +506,7 @@ func (c *Config) normalize() {
 	sort.Strings(c.Prune.Required)
 	sort.Strings(c.Deny.Imports)
 	sort.Strings(c.Dependencies.CopyPackages)
+	sort.Strings(c.Dependencies.ForbiddenModules)
 
 	sort.SliceStable(c.Types.Pairs, func(i, j int) bool {
 		if c.Types.Pairs[i].Internal != c.Types.Pairs[j].Internal {

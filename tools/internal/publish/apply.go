@@ -11,12 +11,11 @@ import (
 
 // Scope selects which half of a plan one push carries.
 //
-// The two halves never travel together. Consumer refs move only after every
-// gate above this package has passed, while progress and state refs are written
-// between backfill chunks precisely when the gates have not all run yet. An
-// atomic push carrying both would mean either that bookkeeping waits for a
-// release or that a release rides along with bookkeeping, and the second is how
-// a half finished backfill becomes a published module version.
+// Ordinary publication keeps the two halves separate. Consumer refs move only
+// after every gate above this package has passed, while progress and state refs
+// are written between backfill chunks. The one exception is post-publication
+// reconciliation: state advances in an atomic push that also sends unchanged
+// consumer/progress refspecs solely to lease the observations state records.
 type Scope string
 
 // The publication scopes.
@@ -26,6 +25,9 @@ const (
 	// ScopeNonConsumer carries progress and state refs, which no consumer and
 	// no module proxy reads.
 	ScopeNonConsumer Scope = "non-consumer"
+	// ScopeReconcile atomically advances state while leasing no-op consumer and
+	// progress observations. It never permits a consumer ref to move.
+	ScopeReconcile Scope = "reconcile"
 )
 
 // covers reports whether an action belongs to this scope.
@@ -35,13 +37,17 @@ func (s Scope) covers(action Action) bool {
 		return action.Consumer
 	case ScopeNonConsumer:
 		return !action.Consumer
+	case ScopeReconcile:
+		return true
 	default:
 		return false
 	}
 }
 
-// valid reports whether s is one of the two scopes.
-func (s Scope) valid() bool { return s == ScopeConsumer || s == ScopeNonConsumer }
+// valid reports whether s is a supported publication scope.
+func (s Scope) valid() bool {
+	return s == ScopeConsumer || s == ScopeNonConsumer || s == ScopeReconcile
+}
 
 // ApplyOptions configures one execution of an approved plan.
 type ApplyOptions struct {
@@ -141,7 +147,7 @@ func (p *Publisher) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*
 		return nil, errors.New("publication apply: a plan is required")
 	}
 	if !opts.Scope.valid() {
-		return nil, fmt.Errorf("publication apply: scope %q must be %s or %s", string(opts.Scope), string(ScopeConsumer), string(ScopeNonConsumer))
+		return nil, fmt.Errorf("publication apply: scope %q must be %s, %s, or %s", string(opts.Scope), string(ScopeConsumer), string(ScopeNonConsumer), string(ScopeReconcile))
 	}
 	if err := plan.Manifest.Verify(); err != nil {
 		return nil, fmt.Errorf("publication apply: %w", err)
@@ -157,6 +163,13 @@ func (p *Publisher) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*
 	}
 	if plan.Manifest.ObjectFormat != string(p.format) {
 		return nil, fmt.Errorf("publication apply: %w: it names object format %s and this publisher reads %s", ErrScopeMismatch, plan.Manifest.ObjectFormat, string(p.format))
+	}
+	if opts.Scope == ScopeReconcile {
+		for _, action := range plan.Manifest.Actions {
+			if action.Consumer && action.Effect != EffectNoOp {
+				return nil, fmt.Errorf("publication apply: reconciliation cannot move consumer ref %s with effect %s", action.Ref, action.Effect)
+			}
+		}
 	}
 
 	result := &Result{Scope: opts.Scope, Actions: plan.Actions(opts.Scope), DryRun: opts.DryRun}
@@ -175,17 +188,15 @@ func (p *Publisher) Apply(ctx context.Context, plan *Plan, opts ApplyOptions) (*
 	for _, action := range result.Actions {
 		if action.Effect == EffectNoOp {
 			result.NoOps = append(result.NoOps, action.Ref)
-			continue
+			if opts.Scope != ScopeReconcile {
+				continue
+			}
 		}
 		pending = append(pending, action)
 	}
-	// A ref that already holds the planned object is reported against the read
-	// above, and only the pending refs carry a lease into the push. So a no-op
-	// ref that another writer moves after that read is reported as a no-op it
-	// no longer is. The bound on that is worth stating: this publication still
-	// writes nothing to it, so the mistake is in the report rather than in what
-	// was published, and any report of a remote is a statement about when it
-	// was read.
+	// Ordinary scopes omit no-op refs. Reconciliation deliberately sends them
+	// with leases in the same atomic push as state, so state can never record a
+	// consumer or progress observation that changed between the read and push.
 	if len(pending) == 0 {
 		// Everything was already published. Nothing is sent, and the absence of
 		// a push is the correct outcome rather than a skipped one.

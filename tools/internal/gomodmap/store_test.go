@@ -47,6 +47,75 @@ func sampleIndex(t *testing.T) *gomodmap.Index {
 	return index
 }
 
+func TestEncodeDecodeCanonicalRoundTrip(t *testing.T) {
+	index := sampleIndex(t)
+	encoded, err := gomodmap.Encode(index)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := gomodmap.Decode(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	again, err := gomodmap.Encode(decoded)
+	if err != nil {
+		t.Fatalf("encode decoded index: %v", err)
+	}
+	if string(again) != string(encoded) {
+		t.Fatalf("canonical bytes changed:\n%s\nthen:\n%s", encoded, again)
+	}
+	for _, suffix := range []string{"{}", " garbage"} {
+		withTrailing := append(append([]byte(nil), encoded...), suffix...)
+		if _, err := gomodmap.Decode(withTrailing); !errors.Is(err, gomodmap.ErrIndexCorrupt) {
+			t.Errorf("trailing %q: error = %v, want ErrIndexCorrupt", suffix, err)
+		}
+	}
+}
+
+func TestStoreSnapshotAndRestore(t *testing.T) {
+	ctx := t.Context()
+	source := newTestStore(t)
+	index := sampleIndex(t)
+	if err := source.Save(ctx, index); err != nil {
+		t.Fatalf("save source: %v", err)
+	}
+	data, snap, err := source.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap.Len() != index.Len() {
+		t.Errorf("snapshot entries = %d, want %d", snap.Len(), index.Len())
+	}
+
+	destination := newTestStore(t)
+	future := gomodmap.NewIndex()
+	if err := future.Put(gomodmap.Entry{
+		Source:  strings.Repeat("4", 40),
+		Modules: []gomodmap.ModuleVersion{pinnedAt("k8s.io/api", stagingA)},
+	}); err != nil {
+		t.Fatalf("build future cache entry: %v", err)
+	}
+	if err := destination.Save(ctx, future); err != nil {
+		t.Fatalf("save future cache: %v", err)
+	}
+	if err := destination.Restore(ctx, data); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	restored, err := destination.Load(ctx)
+	if err != nil {
+		t.Fatalf("load restored index: %v", err)
+	}
+	if restored.Len() != index.Len() {
+		t.Errorf("restored entries = %d, want exactly the checkpoint's %d", restored.Len(), index.Len())
+	}
+	if _, ok := restored.Lookup(strings.Repeat("4", 40)); ok {
+		t.Error("restore retained an entry from a future local attempt")
+	}
+	if err := destination.Restore(ctx, append(append([]byte(nil), data...), ' ')); !errors.Is(err, gomodmap.ErrIndexCorrupt) {
+		t.Errorf("noncanonical restore = %v, want ErrIndexCorrupt", err)
+	}
+}
+
 func TestStore_SaveAndLoad(t *testing.T) {
 	t.Parallel()
 

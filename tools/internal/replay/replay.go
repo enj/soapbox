@@ -101,9 +101,12 @@ type Transformed struct {
 	// object must already exist in the destination repository.
 	Tree string
 	// Changed reports content differing from what the destination parent already
-	// records. It is checked against the trees rather than believed, and the
-	// rules are documented on Run.
+	// records. It is checked against the trees rather than believed.
 	Changed bool
+	// Force records an otherwise unchanged commit. Release boundaries use it so
+	// each immutable destination tag targets a commit carrying the exact source
+	// release provenance even when generated module bytes did not change.
+	Force bool
 	// Evidence records why, for the run's report. It is carried through
 	// unchanged and never affects the shape of the history.
 	Evidence []string
@@ -547,6 +550,8 @@ func (r *run) collapse(sha string, parents []string, transformed Transformed) (b
 	case !unchanged && !transformed.Changed:
 		return false, fmt.Errorf("%w: reported no change, but tree %s is not the baseline %s",
 			ErrTransformChange, transformed.Tree, baseline)
+	case transformed.Force:
+		return false, nil
 	case !unchanged:
 		return false, nil
 	}

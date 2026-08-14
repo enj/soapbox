@@ -683,3 +683,136 @@ func parseIdentityLine(line string) (Signature, error) {
 		Date:  strings.TrimPrefix(line[closing+1:], " "),
 	}, nil
 }
+
+// TagObject is the content of one annotated tag object read by OID.
+type TagObject struct {
+	// InternalName is the "tag" header inside the object. It must match the
+	// ref name the tag is published under; a mismatch means the object was
+	// created for a different name.
+	InternalName string
+	// TargetOID is the "object" header: the OID the tag points at.
+	TargetOID string
+	// TargetType is the "type" header, normally "commit".
+	TargetType string
+	// Tagger is the recorded identity and date.
+	Tagger Signature
+	// Message is the tag message exactly as stored.
+	Message string
+}
+
+// TagObjectByOID reads an annotated tag object by its OID using cat-file.
+//
+// The OID must name a tag object; a commit, tree, or blob is refused. This is
+// the read-by-OID complement to TagInfo, which reads by ref name. It exists so
+// a tag fetched by OID (via FetchExact) can be inspected without a local ref
+// pointing at it.
+func (r *Runner) TagObjectByOID(ctx context.Context, oid string) (TagObject, error) {
+	if !isObjectName(oid) {
+		return TagObject{}, fmt.Errorf("git tag object: %q is not a full object name", oid)
+	}
+	// Verify the object is a tag before reading its body.
+	typeOut, err := r.run(ctx, "cat-file", "-t", "--end-of-options", oid)
+	if err != nil {
+		return TagObject{}, fmt.Errorf("git tag object %s: %w", oid, err)
+	}
+	if got := strings.TrimSpace(typeOut); got != "tag" {
+		return TagObject{}, fmt.Errorf("git tag object %s: object is type %q, want tag", oid, got)
+	}
+
+	body, err := r.runRaw(ctx, nil, "cat-file", "tag", "--end-of-options", oid)
+	if err != nil {
+		return TagObject{}, fmt.Errorf("git tag object %s: %w", oid, err)
+	}
+
+	return parseFullTagObject(body)
+}
+
+// parseFullTagObject parses an annotated tag object body into all its fields.
+//
+// The format is:
+//
+//	object <oid>\n
+//	type <type>\n
+//	tag <name>\n
+//	tagger <identity> <date>\n
+//	\n
+//	<message>
+func parseFullTagObject(body string) (TagObject, error) {
+	header, message, ok := strings.Cut(body, "\n\n")
+	if !ok {
+		return TagObject{}, errors.New("tag object has no message separator")
+	}
+	var result TagObject
+	result.Message = message
+
+	var sawObject, sawType, sawTag, sawTagger bool
+	for _, line := range strings.Split(header, "\n") {
+		key, value, found := strings.Cut(line, " ")
+		if !found {
+			return TagObject{}, fmt.Errorf("tag object has malformed header %q", line)
+		}
+		switch key {
+		case "object":
+			if sawObject {
+				return TagObject{}, errors.New("tag object has duplicate object header")
+			}
+			sawObject = true
+			result.TargetOID = value
+		case "type":
+			if sawType {
+				return TagObject{}, errors.New("tag object has duplicate type header")
+			}
+			sawType = true
+			result.TargetType = value
+		case "tag":
+			if sawTag {
+				return TagObject{}, errors.New("tag object has duplicate tag header")
+			}
+			sawTag = true
+			result.InternalName = value
+		case "tagger":
+			if sawTagger {
+				return TagObject{}, errors.New("tag object has duplicate tagger header")
+			}
+			sawTagger = true
+			tagger, err := parseIdentityLine(value)
+			if err != nil {
+				return TagObject{}, err
+			}
+			result.Tagger = tagger
+		default:
+			return TagObject{}, fmt.Errorf("tag object has unknown header %q", key)
+		}
+	}
+	if result.TargetOID == "" {
+		return TagObject{}, errors.New("tag object has no object header")
+	}
+	if result.TargetType == "" {
+		return TagObject{}, errors.New("tag object has no type header")
+	}
+	if result.InternalName == "" {
+		return TagObject{}, errors.New("tag object has no tag header")
+	}
+	if !sawTagger {
+		return TagObject{}, errors.New("tag object has no tagger header")
+	}
+	if result.Tagger.Name == "" {
+		return TagObject{}, errors.New("tag object tagger has no name")
+	}
+	if result.Tagger.Email == "" {
+		return TagObject{}, errors.New("tag object tagger has no email address")
+	}
+	if err := ValidateRawDate(result.Tagger.Date); err != nil {
+		return TagObject{}, fmt.Errorf("tag object tagger date: %w", err)
+	}
+	if !isObjectName(result.TargetOID) {
+		return TagObject{}, fmt.Errorf("tag object target OID %q is not a full object name", result.TargetOID)
+	}
+	if !slices.Contains(tagTargetTypes, result.TargetType) {
+		return TagObject{}, fmt.Errorf("tag object target type %q is not a valid git object type", result.TargetType)
+	}
+	if err := ValidateBranchName(result.InternalName); err != nil {
+		return TagObject{}, fmt.Errorf("tag object internal name: %w", err)
+	}
+	return result, nil
+}

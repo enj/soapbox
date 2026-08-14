@@ -93,6 +93,46 @@ func TestApplyPartitionsConsumerAndProgressRefs(t *testing.T) {
 	})
 }
 
+func TestApplyReconciliationLeasesObservedRefsAtomically(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := newDestination(ctx, t, "")
+	h := d.buildHistory()
+	tagRef := tagPrefix + "v0.36.1"
+
+	initial := d.planUpdates(
+		Update{Ref: testBranch, Kind: KindBranch, NewObject: h.base, ExpectAbsent: true, Evidence: "initial branch"},
+		Update{Ref: tagRef, Kind: KindTag, NewObject: h.tagBase, ExpectAbsent: true, Evidence: "initial tag"},
+		Update{Ref: testProgressRef, Kind: KindProgress, NewObject: h.base, ExpectAbsent: true, Evidence: "initial progress"},
+		Update{Ref: testStateRef, Kind: KindState, NewObject: h.base, ExpectAbsent: true, Evidence: "initial state"},
+	)
+	d.apply(initial, ScopeNonConsumer)
+	d.apply(initial, ScopeConsumer)
+
+	reconcile := d.planUpdates(
+		Update{Ref: testBranch, Kind: KindBranch, NewObject: h.base, ExpectedOld: h.base, Evidence: "observe branch"},
+		Update{Ref: tagRef, Kind: KindTag, NewObject: h.tagBase, ExpectedOld: h.tagBase, Evidence: "observe tag"},
+		Update{Ref: testProgressRef, Kind: KindProgress, NewObject: h.base, ExpectedOld: h.base, Evidence: "observe progress"},
+		Update{Ref: testStateRef, Kind: KindState, NewObject: h.middle, ExpectedOld: h.base, Evidence: "advance state"},
+	)
+	result := d.apply(reconcile, ScopeReconcile)
+	if len(result.NoOps) != 3 {
+		t.Errorf("reconciliation no-ops = %v, want branch, tag, and progress", result.NoOps)
+	}
+	d.requireRemote(map[string]string{
+		testBranch: h.base, tagRef: h.tagBase,
+		testProgressRef: h.base, testStateRef: h.middle,
+	})
+
+	movingConsumer := d.planUpdates(
+		Update{Ref: testBranch, Kind: KindBranch, NewObject: h.forward, ExpectedOld: h.base, Evidence: "move consumer"},
+		Update{Ref: testStateRef, Kind: KindState, NewObject: h.forward, ExpectedOld: h.middle, Evidence: "advance state"},
+	)
+	if _, err := d.pub.Apply(ctx, movingConsumer, ApplyOptions{Approval: movingConsumer.Hash(), Scope: ScopeReconcile}); err == nil || !strings.Contains(err.Error(), "cannot move consumer ref") {
+		t.Fatalf("reconciliation moving consumer = %v, want refusal", err)
+	}
+}
+
 func TestApplyDryRunPublishesNothing(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

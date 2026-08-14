@@ -151,6 +151,9 @@ func (r *Runner) LoaderEnv(ctx context.Context) ([]string, error) {
 		}
 	}
 	env = append(env, fixedEnv...)
+	if r.modCacheRW {
+		env = append(env, "GOFLAGS=-modcacherw")
+	}
 	return append(env, proxyVariable+"="+r.proxy), nil
 }
 
@@ -251,7 +254,43 @@ func (r *Runner) ListModules(ctx context.Context, queries ...string) ([]Module, 
 	return modules, nil
 }
 
-// PackageError is the reason the go command could not load one package.
+// ModuleWithVersions is one module as go list -m -versions -json reports it.
+type ModuleWithVersions struct {
+	Path     string
+	Version  string
+	Versions []string
+	Error    *ModuleError
+}
+
+// ListModuleVersions queries the proxy for the available versions of a module,
+// including retracted versions.
+//
+// The result includes the Versions field that go list -m -versions populates.
+// Retracted versions are included (-retracted) because a retraction is still a
+// release and a maintenance event: excluding them would undercount the cadence
+// and approve a module whose real release frequency exceeds the ceiling.
+func (r *Runner) ListModuleVersions(ctx context.Context, queries ...string) ([]ModuleWithVersions, error) {
+	if len(queries) == 0 {
+		return nil, errors.New("go list -m -versions: at least one module query is required")
+	}
+	if err := r.requireModuleDir(); err != nil {
+		return nil, fmt.Errorf("go list -m -versions: %w", err)
+	}
+	args, err := appendArguments([]string{"list", "-m", "-versions", "-retracted", "-json", "-e"}, "module query", queries)
+	if err != nil {
+		return nil, fmt.Errorf("go list -m -versions: %w", err)
+	}
+	out, err := r.run(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("go list -m -versions: %w", err)
+	}
+	modules, err := decodeJSONStream[ModuleWithVersions](out)
+	if err != nil {
+		return nil, fmt.Errorf("go list -m -versions: %w", err)
+	}
+	return modules, nil
+}
+
 type PackageError struct {
 	ImportStack []string
 	Pos         string

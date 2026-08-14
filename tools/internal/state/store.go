@@ -3,21 +3,30 @@ package state
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 
 	"github.com/enj/soapbox/tools/internal/gitcli"
+	"github.com/enj/soapbox/tools/internal/gomodmap"
 	"github.com/enj/soapbox/tools/internal/relocate"
 	"github.com/enj/soapbox/tools/internal/treebuild"
 )
 
-// File is the single path a stored record occupies in its own tree.
+// File holds the state document, and MappingFile optionally holds the exact
+// staging index its Mapping field identifies.
 //
 // The record lives in a tree of its own rather than beside the generated
 // module, so nothing about it can reach a module consumer: it is not in the
 // published tree, it is not in the module zip the proxy serves, and no import
 // path resolves into it.
-const File = "state.json"
+const (
+	File        = "state.json"
+	MappingFile = "mapping.json"
+)
 
 // StoreOptions describes one stored record.
 //
@@ -26,9 +35,15 @@ const File = "state.json"
 // commit that took its date from the clock would have a different name on every
 // run, and the property this package exists to provide is that a run which did
 // the same work writes the same objects.
+var ErrMappingEvidenceMissing = errors.New("state record has no reachable mapping evidence")
+
 type StoreOptions struct {
 	// Document is the record to store.
 	Document Document
+	// Mapping is the canonical staging index named by Document.Mapping. Empty
+	// preserves compatibility with records written before mapping blobs became
+	// reachable from the state tree.
+	Mapping []byte
 	// Parents are the previous state commits, in order. A first record has none.
 	Parents []string
 	// Author is the identity the record is attributed to, with a raw date.
@@ -43,7 +58,9 @@ type Record struct {
 	Format gitcli.ObjectFormat
 	// Blob is the object holding the encoded document.
 	Blob string
-	// Tree is the object holding the blob at File.
+	// MappingBlob is the optional object holding MappingFile.
+	MappingBlob string
+	// Tree is the object holding the state and optional mapping blobs.
 	Tree string
 	// Commit is the object holding the tree. No ref points at it.
 	Commit string
@@ -60,13 +77,15 @@ type Record struct {
 // carry nothing about the machine that produced them, so a person approving an
 // outward plan is comparing the work rather than the runner.
 func (r Record) Report() []string {
-	return []string{
+	lines := []string{
 		"format " + string(r.Format),
 		"digest " + r.Digest,
 		"blob " + r.Blob + " bytes " + strconv.FormatInt(r.Bytes, 10),
-		"tree " + r.Tree,
-		"commit " + r.Commit,
 	}
+	if r.MappingBlob != "" {
+		lines = append(lines, "mapping "+r.MappingBlob)
+	}
+	return append(lines, "tree "+r.Tree, "commit "+r.Commit)
 }
 
 // Store writes a document as a blob, a tree, and a commit, and reports their
@@ -98,16 +117,39 @@ func Store(ctx context.Context, git *gitcli.Runner, opts StoreOptions) (Record, 
 		return Record{}, fmt.Errorf("store state: %w", err)
 	}
 
-	manifest, err := treebuild.WriteFileSet(ctx, git, relocate.FileSet{Files: []relocate.File{{
-		Path:     File,
-		Mode:     relocate.ModeRegular,
-		Contents: encoded,
-	}}})
+	files := []relocate.File{{
+		Path: File, Mode: relocate.ModeRegular, Contents: encoded,
+	}}
+	if len(opts.Mapping) > 0 {
+		if err := validateMappingEvidence(opts.Document.Mapping, opts.Mapping); err != nil {
+			return Record{}, fmt.Errorf("store state: %w", err)
+		}
+		files = append(files, relocate.File{
+			Path: MappingFile, Mode: relocate.ModeRegular, Contents: opts.Mapping,
+		})
+	}
+	manifest, err := treebuild.WriteFileSet(ctx, git, relocate.FileSet{Files: files})
 	if err != nil {
 		return Record{}, fmt.Errorf("store state: %w", err)
 	}
-	if len(manifest.Files) != 1 {
-		return Record{}, fmt.Errorf("store state: the record tree holds %d files, want 1", len(manifest.Files))
+	if len(manifest.Files) != len(files) {
+		return Record{}, fmt.Errorf("store state: the record tree holds %d files, want %d", len(manifest.Files), len(files))
+	}
+	var stateBlob, mappingBlob string
+	var stateBytes int64
+	for _, file := range manifest.Files {
+		switch file.Path {
+		case File:
+			stateBlob, stateBytes = file.Object, file.Size
+		case MappingFile:
+			mappingBlob = file.Object
+		}
+	}
+	if stateBlob == "" {
+		return Record{}, fmt.Errorf("store state: the record tree has no %s", File)
+	}
+	if len(opts.Mapping) > 0 && mappingBlob != opts.Document.Mapping.Object {
+		return Record{}, fmt.Errorf("store state: mapping bytes wrote blob %s, document records %s", mappingBlob, opts.Document.Mapping.Object)
 	}
 
 	commit, err := treebuild.WriteSyntheticCommit(ctx, git, treebuild.SyntheticCommitOptions{
@@ -137,14 +179,27 @@ func Store(ctx context.Context, git *gitcli.Runner, opts StoreOptions) (Record, 
 		return Record{}, fmt.Errorf("%w: commit %s holds %s, %s was written",
 			ErrDigest, commit, readBack.Digest, opts.Document.Digest)
 	}
+	if len(opts.Mapping) > 0 {
+		storedMapping, err := git.ReadBlob(ctx, gitcli.BlobOptions{Revision: commit, Path: MappingFile})
+		if err != nil {
+			return Record{}, fmt.Errorf("store state: read back mapping: %w", err)
+		}
+		if !bytes.Equal(storedMapping, opts.Mapping) {
+			return Record{}, fmt.Errorf("store state: commit %s holds %d mapping bytes, %d were written", commit, len(storedMapping), len(opts.Mapping))
+		}
+		if err := validateMappingEvidence(readBack.Mapping, storedMapping); err != nil {
+			return Record{}, fmt.Errorf("store state: read back: %w", err)
+		}
+	}
 
 	return Record{
-		Format: manifest.Format,
-		Blob:   manifest.Files[0].Object,
-		Tree:   manifest.Tree,
-		Commit: commit,
-		Digest: readBack.Digest,
-		Bytes:  manifest.Files[0].Size,
+		Format:      manifest.Format,
+		Blob:        stateBlob,
+		MappingBlob: mappingBlob,
+		Tree:        manifest.Tree,
+		Commit:      commit,
+		Digest:      readBack.Digest,
+		Bytes:       stateBytes,
 	}, nil
 }
 
@@ -153,6 +208,72 @@ func Store(ctx context.Context, git *gitcli.Runner, opts StoreOptions) (Record, 
 // The revision may be a commit or a tree. It is resolved through the object
 // store rather than through a ref, so a caller that already knows which commit
 // it wants to resume from does not have to have published it anywhere.
+func validateMappingEvidence(mapping Mapping, data []byte) error {
+	if mapping.Entries <= 0 {
+		return fmt.Errorf("mapping evidence has %d entries", mapping.Entries)
+	}
+	index, err := gomodmap.Decode(data)
+	if err != nil {
+		return fmt.Errorf("mapping evidence: %w", err)
+	}
+	canonical, err := gomodmap.Encode(index)
+	if err != nil {
+		return fmt.Errorf("mapping evidence: %w", err)
+	}
+	if !bytes.Equal(canonical, data) {
+		return errors.New("mapping evidence is not canonically encoded")
+	}
+	if index.Len() != mapping.Entries {
+		return fmt.Errorf("mapping evidence resolves %d entries, document records %d", index.Len(), mapping.Entries)
+	}
+	sum := sha256.Sum256(data)
+	digest := "sha256:" + hex.EncodeToString(sum[:])
+	if digest != mapping.Digest {
+		return fmt.Errorf("mapping evidence digests to %s, document records %s", digest, mapping.Digest)
+	}
+	return nil
+}
+
+// Inspect describes an existing stored record without rewriting it.
+func Inspect(ctx context.Context, git *gitcli.Runner, revision string) (Record, error) {
+	doc, err := Load(ctx, git, revision)
+	if err != nil {
+		return Record{}, err
+	}
+	commit, err := git.ResolveCommit(ctx, revision)
+	if err != nil {
+		return Record{}, fmt.Errorf("inspect state %s: resolve commit: %w", revision, err)
+	}
+	tree, err := git.ResolveTree(ctx, commit)
+	if err != nil {
+		return Record{}, fmt.Errorf("inspect state %s: resolve tree: %w", revision, err)
+	}
+	entries, err := git.ListTree(ctx, tree)
+	if err != nil {
+		return Record{}, fmt.Errorf("inspect state %s: list tree: %w", revision, err)
+	}
+	var blob, mappingBlob string
+	for _, entry := range entries {
+		switch entry.Path {
+		case File:
+			blob = entry.Object
+		case MappingFile:
+			mappingBlob = entry.Object
+		}
+	}
+	if blob == "" {
+		return Record{}, fmt.Errorf("inspect state %s: tree has no %s", revision, File)
+	}
+	encoded, err := git.ReadBlob(ctx, gitcli.BlobOptions{Revision: commit, Path: File})
+	if err != nil {
+		return Record{}, fmt.Errorf("inspect state %s: %w", revision, err)
+	}
+	return Record{
+		Format: doc.ObjectFormat, Blob: blob, MappingBlob: mappingBlob,
+		Tree: tree, Commit: commit, Digest: doc.Digest, Bytes: int64(len(encoded)),
+	}, nil
+}
+
 func Load(ctx context.Context, git *gitcli.Runner, revision string) (Document, error) {
 	if err := ctx.Err(); err != nil {
 		return Document{}, fmt.Errorf("load state: %w", err)
@@ -172,7 +293,68 @@ func Load(ctx context.Context, git *gitcli.Runner, revision string) (Document, e
 	if err := requireFormat(ctx, git, doc.ObjectFormat); err != nil {
 		return Document{}, fmt.Errorf("load state %s: %w", revision, err)
 	}
+	entries, err := git.ListTree(ctx, revision)
+	if err != nil {
+		return Document{}, fmt.Errorf("load state %s: list record tree: %w", revision, err)
+	}
+	var mappingObject string
+	for _, entry := range entries {
+		switch entry.Path {
+		case File:
+		case MappingFile:
+			mappingObject = entry.Object
+		default:
+			return Document{}, fmt.Errorf("load state %s: record tree contains unexpected path %s", revision, entry.Path)
+		}
+	}
+	if mappingObject != "" {
+		if mappingObject != doc.Mapping.Object {
+			return Document{}, fmt.Errorf("load state %s: mapping tree object %s does not match document object %s", revision, mappingObject, doc.Mapping.Object)
+		}
+		mapping, err := git.ReadBlob(ctx, gitcli.BlobOptions{Revision: revision, Path: MappingFile})
+		if err != nil {
+			return Document{}, fmt.Errorf("load state %s: read mapping: %w", revision, err)
+		}
+		if err := validateMappingEvidence(doc.Mapping, mapping); err != nil {
+			return Document{}, fmt.Errorf("load state %s: %w", revision, err)
+		}
+	}
 	return doc, nil
+}
+
+// LoadMapping reads and verifies the canonical staging index reachable from a
+// state record. Legacy records that named a mapping blob without placing it in
+// their tree report ErrMappingEvidenceMissing rather than fetching an unrelated
+// object by name.
+func LoadMapping(ctx context.Context, git *gitcli.Runner, revision string) ([]byte, *gomodmap.Index, error) {
+	doc, err := Load(ctx, git, revision)
+	if err != nil {
+		return nil, nil, err
+	}
+	if doc.Mapping.Entries == 0 {
+		return nil, gomodmap.NewIndex(), nil
+	}
+	entries, err := git.ListTree(ctx, revision)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load state mapping %s: %w", revision, err)
+	}
+	if !slices.ContainsFunc(entries, func(entry gitcli.TreeEntry) bool {
+		return entry.Path == MappingFile && entry.Object == doc.Mapping.Object
+	}) {
+		return nil, nil, fmt.Errorf("load state mapping %s: %w", revision, ErrMappingEvidenceMissing)
+	}
+	data, err := git.ReadBlob(ctx, gitcli.BlobOptions{Revision: revision, Path: MappingFile})
+	if err != nil {
+		return nil, nil, fmt.Errorf("load state mapping %s: %w", revision, err)
+	}
+	if err := validateMappingEvidence(doc.Mapping, data); err != nil {
+		return nil, nil, fmt.Errorf("load state mapping %s: %w", revision, err)
+	}
+	index, err := gomodmap.Decode(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load state mapping %s: %w", revision, err)
+	}
+	return data, index, nil
 }
 
 // requireFormat reports a document whose object names belong to a repository

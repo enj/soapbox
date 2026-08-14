@@ -17,9 +17,9 @@ import (
 	"github.com/enj/soapbox/tools/internal/ghapi"
 )
 
-// testToken stands in for a live installation token. No URL, header other than
+// testToken stands in for a live workflow token. No URL, header other than
 // Authorization, or error message this package produces may contain it.
-const testToken = "ghs_notarealinstallationtoken00000"
+const testToken = "ghs_notarealworkflowtoken000000000"
 
 // recorded is one request as the server received it.
 type recorded struct {
@@ -334,71 +334,6 @@ func TestRequestCarriesTheFixedHeadersAndNoCredentialInTheURL(t *testing.T) {
 	}
 }
 
-func TestCreateInstallationTokenSendsTheNarrowingBody(t *testing.T) {
-	t.Parallel()
-
-	stub := newAPI(t, func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(t, w, http.StatusCreated, map[string]any{
-			"token":                testToken,
-			"expires_at":           "2026-08-12T12:00:00Z",
-			"permissions":          map[string]string{"contents": "write"},
-			"repository_selection": "selected",
-			"repositories":         []map[string]any{{"name": "rbac_authorizer", "full_name": "enj/rbac_authorizer"}},
-		})
-	})
-	client := stub.client(t, nil)
-
-	minted, err := client.CreateInstallationToken(t.Context(), 42, ghapi.InstallationTokenRequest{
-		Repositories: []string{"rbac_authorizer"},
-		Permissions:  map[string]string{"contents": "write", "issues": "write"},
-	})
-	if err != nil {
-		t.Fatalf("CreateInstallationToken: %v", err)
-	}
-	if minted.Token != testToken {
-		t.Errorf("token = %q, want the minted value", minted.Token)
-	}
-	if minted.RepositorySelection != "selected" {
-		t.Errorf("selection = %q, want selected", minted.RepositorySelection)
-	}
-	if want := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC); !minted.ExpiresAt.Equal(want) {
-		t.Errorf("expiry = %s, want %s", minted.ExpiresAt, want)
-	}
-
-	got := stub.only(t)
-	if got.Method != http.MethodPost {
-		t.Errorf("method = %q, want POST", got.Method)
-	}
-	if got.Path != "/app/installations/42/access_tokens" {
-		t.Errorf("path = %q, want /app/installations/42/access_tokens", got.Path)
-	}
-	if contentType := got.Header.Get("Content-Type"); contentType != "application/json" {
-		t.Errorf("content type = %q, want application/json", contentType)
-	}
-	const wantBody = `{"repositories":["rbac_authorizer"],"permissions":{"contents":"write","issues":"write"}}`
-	if body := strings.TrimSpace(string(got.Body)); body != wantBody {
-		t.Errorf("body = %s, want %s", body, wantBody)
-	}
-}
-
-func TestInstallationTokenStringOmitsTheSecret(t *testing.T) {
-	t.Parallel()
-
-	minted := ghapi.InstallationToken{
-		Token:               testToken,
-		ExpiresAt:           time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC),
-		RepositorySelection: "selected",
-		Permissions:         map[string]string{"contents": "write"},
-	}
-	rendered := fmt.Sprintf("%v", minted)
-	if strings.Contains(rendered, testToken) {
-		t.Fatalf("rendering %q carries the token", rendered)
-	}
-	if !strings.Contains(rendered, "2026-08-12T12:00:00Z") {
-		t.Fatalf("rendering %q does not report the expiry", rendered)
-	}
-}
-
 func TestRepositoryReadsTheDefaultBranch(t *testing.T) {
 	t.Parallel()
 
@@ -506,39 +441,6 @@ func TestListOpenIssuesDropsPullRequestsAndPaginates(t *testing.T) {
 	}
 	if want := "labels=soapbox%2Csync&page=1&per_page=100&state=open"; requests[0].RawQuery != want {
 		t.Fatalf("first query = %q, want %q", requests[0].RawQuery, want)
-	}
-}
-
-func TestInstallationRepositoriesPaginates(t *testing.T) {
-	t.Parallel()
-
-	page := make([]map[string]any, 0, 100)
-	for i := range 100 {
-		page = append(page, map[string]any{"name": fmt.Sprintf("r%d", i), "full_name": fmt.Sprintf("enj/r%d", i)})
-	}
-	stub := newAPI(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("page") == "1" {
-			writeJSON(t, w, http.StatusOK, map[string]any{"total_count": 101, "repositories": page})
-			return
-		}
-		writeJSON(t, w, http.StatusOK, map[string]any{
-			"total_count":  101,
-			"repositories": []map[string]any{{"name": "last", "full_name": "enj/last"}},
-		})
-	})
-
-	repositories, err := stub.client(t, nil).InstallationRepositories(t.Context())
-	if err != nil {
-		t.Fatalf("InstallationRepositories: %v", err)
-	}
-	if len(repositories) != 101 {
-		t.Fatalf("got %d repositories, want 101", len(repositories))
-	}
-	if last := repositories[100].FullName; last != "enj/last" {
-		t.Fatalf("last repository = %q, want enj/last", last)
-	}
-	if requests := stub.recordedRequests(); len(requests) != 2 {
-		t.Fatalf("made %d requests, want 2", len(requests))
 	}
 }
 
@@ -937,7 +839,7 @@ func TestAuthorizerFailureStopsTheRequest(t *testing.T) {
 		t.Error("the server was reached without a credential")
 		writeJSON(t, w, http.StatusOK, map[string]any{})
 	})
-	refusal := errors.New("no installation token")
+	refusal := errors.New("no workflow token")
 	client := stub.client(t, func(cfg *ghapi.Config) {
 		cfg.Authorizer = ghapi.AuthorizerFunc(func(context.Context) (string, error) { return "", refusal })
 	})

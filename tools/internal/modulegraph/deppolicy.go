@@ -278,9 +278,10 @@ func (g *Graph) adaptPackage(pkg *packages.Package) *deppolicy.Package {
 		Info:       pkg.TypesInfo,
 		// The policy opens Dir as a root and reads the named files inside it,
 		// so these are base names rather than the loader's absolute paths.
-		GoFiles:    baseNames(pkg.GoFiles),
-		OtherFiles: baseNames(pkg.OtherFiles),
-		Imports:    importPaths(pkg),
+		GoFiles:      baseNames(pkg.GoFiles),
+		OtherFiles:   baseNames(pkg.OtherFiles),
+		IgnoredFiles: baseNames(pkg.IgnoredFiles),
+		Imports:      importPaths(pkg),
 	}
 }
 

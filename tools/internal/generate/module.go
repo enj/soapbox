@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/enj/soapbox/tools/internal/config"
 	"github.com/enj/soapbox/tools/internal/gomodmap"
 	"github.com/enj/soapbox/tools/internal/modgen"
 )
@@ -87,7 +88,10 @@ func (r *run) verifyModule(ctx context.Context, dir string, requirements []gomod
 	// toolchain, proxy, or filesystem condition. Only the two sentinels below
 	// mean the toolchain disagreed with the module this engine wrote, which is
 	// the finding this pass exists to produce.
-	report, err := modgen.Verify(ctx, runner, modgen.VerifyOptions{Dir: dir, GoMod: goMod})
+	report, err := modgen.Verify(ctx, runner, modgen.VerifyOptions{
+		Dir: dir, GoMod: goMod,
+		AllowAdditions: r.cfg.Compatibility.Apiserver == config.CompatibilityApiserverLocal,
+	})
 	if err != nil {
 		return nil, classify(stageModule, fmt.Errorf("%s module: %w", name, err), moduleSemantic...)
 	}

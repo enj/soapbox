@@ -8,13 +8,10 @@ import (
 	"strings"
 )
 
-// gitHost and apiHost are the only remote hosts the engine talks to. Source and
-// destination URLs are allowlisted so a profile cannot redirect authenticated
-// pushes or unauthenticated clones to an attacker controlled host.
-const (
-	gitHost = "github.com"
-	apiHost = "api.github.com"
-)
+// gitHost is the only remote host the engine talks to. Source and destination
+// URLs are allowlisted so a profile cannot redirect authenticated pushes or
+// unauthenticated clones to an attacker controlled host.
+const gitHost = "github.com"
 
 // redactedURL replaces user information, or a whole URL that cannot be rendered
 // safely, in every diagnostic. It carries no characters that URL encoding would

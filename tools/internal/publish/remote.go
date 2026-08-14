@@ -192,6 +192,46 @@ func redact(remote string) string {
 	return parsed.String()
 }
 
+// HTTPSRemote lists the refs of a destination over the network using git
+// ls-remote through the typed Git boundary.
+//
+// It covers the production case: a github.com HTTPS destination whose
+// credentials travel through the Git runner's package-owned runtime
+// configuration. The runner must carry a GitHubTokenCredential; the remote URL
+// must never embed credentials.
+type HTTPSRemote struct {
+	git *gitcli.Runner
+}
+
+// NewHTTPSRemote builds a lister for network destinations.
+func NewHTTPSRemote(git *gitcli.Runner) *HTTPSRemote { return &HTTPSRemote{git: git} }
+
+// RemoteRefs reports the refs a network destination advertises.
+func (h *HTTPSRemote) RemoteRefs(ctx context.Context, remote string) ([]gitcli.Ref, error) {
+	if h == nil || h.git == nil {
+		return nil, fmt.Errorf("https remote refs: no git runner")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("https remote refs: %w", err)
+	}
+	local, err := isLocalRemote(remote)
+	if err != nil {
+		return nil, fmt.Errorf("https remote refs: %w", err)
+	}
+	if local {
+		return nil, fmt.Errorf("https remote refs: %q is a local destination, use LocalRemote", redact(remote))
+	}
+	format, err := h.git.ObjectFormat(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("https remote refs: %w", err)
+	}
+	refs, err := h.git.RemoteRefs(ctx, remote, format.HexLength())
+	if err != nil {
+		return nil, fmt.Errorf("https remote refs: %w", err)
+	}
+	return refs, nil
+}
+
 // remoteRefs reads the destination and indexes it by ref name.
 //
 // Every advertised object name is checked against the destination's hash

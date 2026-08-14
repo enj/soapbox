@@ -2,7 +2,7 @@
 #
 # This profile is decoded strictly. Unknown fields, duplicate keys, and multiple
 # YAML documents are rejected. Run "soapbox validate" after every edit.
-version: 1
+version: 2
 
 source:
   repository: https://github.com/kubernetes/kubernetes.git
@@ -100,30 +100,61 @@ types:
       external: k8s.io/api/rbac/v1
 
 dependencies:
-  # Staging modules stay external. Copying k8s.io/apiserver would break real
-  # authorizer type identity, request context keys, feature gates, and CVE
-  # module identity for no measured benefit.
-  policy: external
-  copyPackages: []
+  # The first published release (v0.36.1) ships with policy: external and an
+  # empty copy list, so k8s.io/component-helpers remained external. The next
+  # profile revision copies one pure-leaf package from that module and then
+  # forbids the module entirely, so the copy is the only way it enters the
+  # generated build.
+  policy: copy-approved
+  copyPackages:
+    - staging/src/k8s.io/component-helpers/auth/rbac/validation
+  forbiddenModules:
+    - k8s.io/apiserver
+    - k8s.io/component-helpers
   gates:
     # Correctness gates are never overridable.
     interoperability: true
     globalState: true
     diamond: true
     cost:
-      maxCopiedPackages: 0
-      maxCopiedLines: 0
+      maxCopiedPackages: 1
+      maxCopiedLines: 200
       maxGeneratedFiles: 0
-      maxDistinctLicenses: 0
-      maxModuleZipBytes: 0
-      # Cadence ceiling and the minimum benefit a copy would have to deliver.
-      # Every value is zero because this profile copies nothing, and a zero
-      # ceiling admits nothing rather than admitting everything.
-      maxReleasesPerMinor: 0
-      minModulesRemoved: 0
-      minPackagesRemoved: 0
-      minLinesRemoved: 0
-  overrides: []
+      maxDistinctLicenses: 1
+      # The component-helpers module zip is ~130 KiB at v0.36.1. A ceiling of
+      # 256 KiB admits the current release and its expected growth within one
+      # minor series.
+      maxModuleZipBytes: 262144
+      # Through v0.36.3 the release-bounded series contains 10 alpha, beta, RC,
+      # and stable versions. Versions after the source release cutoff are ignored.
+      maxReleasesPerMinor: 10
+      # The copy must remove at least the component-helpers module and one
+      # package (the copied package itself, which was the only import).
+      minModulesRemoved: 1
+      minPackagesRemoved: 1
+      minLinesRemoved: 1
+  overrides:
+    # The package is authorization logic, so the path-based security cost gate
+    # correctly requires explicit ownership of its CVE response. Release-bounded
+    # regeneration plus differential Covers tests are the compensating proof.
+    - package: staging/src/k8s.io/component-helpers/auth/rbac/validation
+      gate: securityCritical
+      justification: >-
+        The copied Covers implementation is differentially tested against the
+        exact upstream module and regenerated at every bounded source release.
+      approver: Monis Khan
+      expiresAfter: v1.36
+    # go/packages does not retain syntax for external dependency packages in the
+    # loaded graph, so its line-removal metric is zero even though the measured
+    # result removes one module and its only compiled package.
+    - package: staging/src/k8s.io/component-helpers/auth/rbac/validation
+      gate: minimumLeverage
+      justification: >-
+        Measured module and package removal are both one; external dependency
+        syntax is unavailable for the line-removal metric and copied lines stay
+        below the independently enforced 200-line ceiling.
+      approver: Monis Khan
+      expiresAfter: v1.36
 
 # Ordered unified diffs applied before relocation and import rewriting.
 patches: []
@@ -210,11 +241,10 @@ release:
 
 commit:
   authorPolicy: preserve-upstream
-  # The GitHub App bot commits generated history. Its numeric user id is added
-  # to the email when the App exists.
+  # The github-actions bot commits generated history.
   committer:
-    name: soapbox[bot]
-    email: soapbox[bot]@users.noreply.github.com
+    name: github-actions[bot]
+    email: 41898282+github-actions[bot]@users.noreply.github.com
   trailerKey: Kubernetes-commit
   sign: false
 
@@ -225,12 +255,15 @@ vanity:
   repositoryURL: https://github.com/enj/rbac_authorizer
   probeURL: https://monis.app/kk/rbac_authorizer?go-get=1
 
-# Only environment variable names live here. Secret values never do.
-githubApp:
-  appIDEnv: SOAPBOX_GITHUB_APP_ID
-  installationIDEnv: SOAPBOX_GITHUB_INSTALLATION_ID
-  privateKeyEnv: SOAPBOX_GITHUB_APP_PRIVATE_KEY
-  apiBaseURL: https://api.github.com
+# Publication mode. Manual requires an exact reviewed approval; automatic adds
+# -unattended so scheduled sync runs reconcile without further intervention.
+publication:
+  mode: automatic
+
+# Compatibility mode. Local means the generated module may use in-tree apiserver
+# helpers that are not published as staging modules.
+compatibility:
+  apiserver: local
 
 determinism:
   toolchain: go1.26.5

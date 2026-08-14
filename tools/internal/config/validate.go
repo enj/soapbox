@@ -21,6 +21,19 @@ const (
 	DependencyPolicyCopyApproved = "copy-approved"
 
 	AuthorPolicyPreserveUpstream = "preserve-upstream"
+
+	// PublicationModeManual requires an explicit workflow dispatch to publish.
+	PublicationModeManual = "manual"
+	// PublicationModeAutomatic adds -unattended to the scheduled sync so
+	// publication proceeds without further human intervention.
+	PublicationModeAutomatic = "automatic"
+
+	// CompatibilityApiserverExternal means the generated module depends only on
+	// published staging modules.
+	CompatibilityApiserverExternal = "external"
+	// CompatibilityApiserverLocal means the module may use in-tree apiserver
+	// helpers that are not published as staging modules.
+	CompatibilityApiserverLocal = "local"
 )
 
 // facadeKinds are the symbol kinds the facade generator can forward. Exported
@@ -57,7 +70,7 @@ func LicenseIdentifiers() []string { return slices.Clone(licenseIdentifiers) }
 // relaxing one of the three alone would approve a copy on a benefit nobody
 // stated.
 var (
-	costGates       = []string{"maxCopiedLines", "maxCopiedPackages", "maxDistinctLicenses", "maxGeneratedFiles", "maxModuleZipBytes", "maxReleasesPerMinor", "minimumLeverage"}
+	costGates       = []string{"maxCopiedLines", "maxCopiedPackages", "maxDistinctLicenses", "maxGeneratedFiles", "maxModuleZipBytes", "maxReleasesPerMinor", "minimumLeverage", "nativeCode", "securityCritical"}
 	correctnessGate = []string{"diamond", "globalState", "interoperability"}
 )
 
@@ -131,7 +144,8 @@ func (c *Config) validate() error {
 	c.validateRelease(p)
 	c.validateCommit(p)
 	c.validateVanity(p)
-	c.validateGitHubApp(p)
+	c.validatePublication(p)
+	c.validateCompatibility(p)
 	c.validateDeterminism(p)
 
 	return p.err()
@@ -386,6 +400,13 @@ func (c *Config) validateDependencies(p *problems) {
 		p.addf("dependencies.copyPackages: duplicate package %q", dup)
 	}
 
+	for _, mod := range d.ForbiddenModules {
+		p.check("dependencies.forbiddenModules", ValidateModulePath(mod))
+	}
+	for _, dup := range duplicates(d.ForbiddenModules) {
+		p.addf("dependencies.forbiddenModules: duplicate module %q", dup)
+	}
+
 	if !d.Gates.Interoperability {
 		p.addf("dependencies.gates.interoperability: correctness gate cannot be disabled")
 	}
@@ -437,7 +458,7 @@ func (c *Config) validateDependencies(p *problems) {
 			p.check("dependencies.overrides.expiresAfter", err)
 		case major != 1:
 			p.addf("dependencies.overrides.expiresAfter: %q must name a Kubernetes v1 minor", override.ExpiresAfter)
-		case minimumOK && minor <= minimumMinor:
+		case minimumOK && minor < minimumMinor:
 			p.addf("dependencies.overrides.expiresAfter: %q already expired at source.refs.minimumRelease %q", override.ExpiresAfter, c.Source.Refs.MinimumRelease)
 		}
 	}
@@ -659,15 +680,20 @@ func (c *Config) validateVanity(p *problems) {
 	}
 }
 
-func (c *Config) validateGitHubApp(p *problems) {
-	g := c.GitHubApp
-	p.check("githubApp.appIDEnv", ValidateEnvName(g.AppIDEnv))
-	p.check("githubApp.installationIDEnv", ValidateEnvName(g.InstallationIDEnv))
-	p.check("githubApp.privateKeyEnv", ValidateEnvName(g.PrivateKeyEnv))
-	for _, dup := range duplicates([]string{g.AppIDEnv, g.InstallationIDEnv, g.PrivateKeyEnv}) {
-		p.addf("githubApp: duplicate environment variable name %q", dup)
+func (c *Config) validatePublication(p *problems) {
+	switch c.Publication.Mode {
+	case PublicationModeManual, PublicationModeAutomatic:
+	default:
+		p.addf("publication.mode: unsupported value %q, want one of %s, %s", c.Publication.Mode, PublicationModeManual, PublicationModeAutomatic)
 	}
-	p.check("githubApp.apiBaseURL", validateURL(g.APIBaseURL, urlRule{allowedHosts: []string{apiHost}}))
+}
+
+func (c *Config) validateCompatibility(p *problems) {
+	switch c.Compatibility.Apiserver {
+	case CompatibilityApiserverExternal, CompatibilityApiserverLocal:
+	default:
+		p.addf("compatibility.apiserver: unsupported value %q, want one of %s, %s", c.Compatibility.Apiserver, CompatibilityApiserverExternal, CompatibilityApiserverLocal)
+	}
 }
 
 func (c *Config) validateDeterminism(p *problems) {

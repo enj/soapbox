@@ -194,6 +194,9 @@ type Result struct {
 	// unexported so an apply cannot be pointed at a repository the plan was never
 	// computed for.
 	publisher *publish.Publisher
+	// trusted is populated only by PlanFinal after discovery and completed-track
+	// checks. It enables the post-consumer reconciliation in ApplyTrusted.
+	trusted *trustedFinalize
 }
 
 // Plan computes one complete synchronization, generation included, and reports
@@ -361,33 +364,11 @@ func newRun(ctx context.Context, opts ProjectOptions) (*run, error) {
 // disagreement would be invisible because each half would be individually
 // consistent.
 func (r *run) bind(ctx context.Context) error {
-	dest := r.opts.Destination
-	lister := dest.Lister
-	if lister == nil {
-		// A destination this engine cannot read is a destination it cannot plan
-		// for. The local reader is the only one it builds, so a network remote
-		// without a lister is refused here rather than at the first read, where
-		// the failure would arrive as a path parsing error about an https URL.
-		if !isLocalRemote(dest.Remote) {
-			return fmt.Errorf("%w: %w", ErrPublicationDisabled, publish.ErrRemoteRefsUnsupported)
-		}
-		lister = publish.NewLocalRemote(r.git)
-	}
-	publisher, err := publish.New(ctx, r.git, publish.Options{
-		Remote:           dest.Remote,
-		Identity:         dest.Identity,
-		AllowLocalRemote: dest.AllowLocalRemote,
-		Namespaces: publish.Namespaces{
-			StateRef:       r.opts.Config.Destination.StateRef,
-			ProgressPrefix: r.opts.Config.Destination.ProgressRefPrefix,
-		},
-		Lister:       lister,
-		ObjectFormat: r.format,
-	})
+	publisher, lister, err := publisherForDestination(ctx, r.git, r.opts.Destination, r.opts.Config, r.format)
 	if err != nil {
 		return fmt.Errorf("synchronization: %w", err)
 	}
-	refs, err := lister.RemoteRefs(ctx, dest.Remote)
+	refs, err := lister.RemoteRefs(ctx, r.opts.Destination.Remote)
 	if err != nil {
 		return fmt.Errorf("synchronization: read the destination: %w", err)
 	}
@@ -397,6 +378,31 @@ func (r *run) bind(ctx context.Context) error {
 	}
 	r.publisher, r.observed = publisher, observed
 	return nil
+}
+
+func publisherForDestination(ctx context.Context, git *gitcli.Runner, dest Destination, cfg *config.Config, format gitcli.ObjectFormat) (*publish.Publisher, publish.RemoteRefLister, error) {
+	lister := dest.Lister
+	if lister == nil {
+		if !isLocalRemote(dest.Remote) {
+			return nil, nil, fmt.Errorf("%w: %w", ErrPublicationDisabled, publish.ErrRemoteRefsUnsupported)
+		}
+		lister = publish.NewLocalRemote(git)
+	}
+	publisher, err := publish.New(ctx, git, publish.Options{
+		Remote:           dest.Remote,
+		Identity:         dest.Identity,
+		AllowLocalRemote: dest.AllowLocalRemote,
+		Namespaces: publish.Namespaces{
+			StateRef:       cfg.Destination.StateRef,
+			ProgressPrefix: cfg.Destination.ProgressRefPrefix,
+		},
+		Lister:       lister,
+		ObjectFormat: format,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return publisher, lister, nil
 }
 
 // execute runs the destination half of the pipeline in dependency order.
@@ -470,41 +476,10 @@ func (r *run) resolveParent(ctx context.Context) error {
 }
 
 func (r *run) writeTree(ctx context.Context) error {
-	parentTree, err := r.git.ResolveTree(ctx, r.parent)
-	if err != nil {
-		return fmt.Errorf("synchronization: resolve the control-plane tree: %w", err)
-	}
-	parentFiles, err := r.git.ListTree(ctx, parentTree)
-	if err != nil {
-		return fmt.Errorf("synchronization: read the control-plane tree: %w", err)
-	}
-	if err := checkControlPlane(parentFiles); err != nil {
-		return err
-	}
-
-	generated, err := treebuild.WriteFileSet(ctx, r.git, r.opts.Module.Files)
+	generated, err := composeModuleTree(ctx, r.git, r.opts.Config, r.parent, r.opts.Module.Files)
 	if err != nil {
 		return fmt.Errorf("synchronization: %w", err)
 	}
-	generatedPaths := make(map[string]bool, len(generated.Files))
-	entries := make([]gitcli.TreeEntry, 0, len(parentFiles)+len(generated.Files))
-	for _, file := range generated.Files {
-		generatedPaths[file.Path] = true
-	}
-	for _, file := range parentFiles {
-		if generatedPaths[file.Path] || generatedOwnedPath(r.opts.Config, file.Path) {
-			continue
-		}
-		entries = append(entries, file)
-	}
-	for _, file := range generated.Files {
-		entries = append(entries, gitcli.TreeEntry{Mode: file.Mode, Object: file.Object, Path: file.Path})
-	}
-	fullTree, err := r.git.WriteTree(ctx, entries)
-	if err != nil {
-		return fmt.Errorf("synchronization: compose the generated and control-plane trees: %w", err)
-	}
-	generated.Tree = fullTree
 	r.result.Tree = generated
 	return nil
 }
@@ -526,6 +501,45 @@ func generatedOwnedPath(cfg *config.Config, name string) bool {
 
 // checkControlPlane proves the parent is a setup-derived repository rather than
 // merely whichever commit happened to be HEAD in the supplied directory.
+func composeModuleTree(ctx context.Context, git *gitcli.Runner, cfg *config.Config, parent string, files relocate.FileSet) (treebuild.Manifest, error) {
+	parentTree, err := git.ResolveTree(ctx, parent)
+	if err != nil {
+		return treebuild.Manifest{}, fmt.Errorf("resolve the control-plane tree: %w", err)
+	}
+	parentFiles, err := git.ListTree(ctx, parentTree)
+	if err != nil {
+		return treebuild.Manifest{}, fmt.Errorf("read the control-plane tree: %w", err)
+	}
+	if err := checkControlPlane(parentFiles); err != nil {
+		return treebuild.Manifest{}, err
+	}
+
+	generated, err := treebuild.WriteFileSet(ctx, git, files)
+	if err != nil {
+		return treebuild.Manifest{}, err
+	}
+	generatedPaths := make(map[string]bool, len(generated.Files))
+	entries := make([]gitcli.TreeEntry, 0, len(parentFiles)+len(generated.Files))
+	for _, file := range generated.Files {
+		generatedPaths[file.Path] = true
+	}
+	for _, file := range parentFiles {
+		if generatedPaths[file.Path] || generatedOwnedPath(cfg, file.Path) {
+			continue
+		}
+		entries = append(entries, file)
+	}
+	for _, file := range generated.Files {
+		entries = append(entries, gitcli.TreeEntry{Mode: file.Mode, Object: file.Object, Path: file.Path})
+	}
+	fullTree, err := git.WriteTree(ctx, entries)
+	if err != nil {
+		return treebuild.Manifest{}, fmt.Errorf("compose the generated and control-plane trees: %w", err)
+	}
+	generated.Tree = fullTree
+	return generated, nil
+}
+
 func checkControlPlane(files []gitcli.TreeEntry) error {
 	present := make(map[string]bool, len(files))
 	for _, file := range files {
@@ -661,16 +675,12 @@ func (r *run) record(ctx context.Context) error {
 		// consumer push that then failed would leave a record asserting that a
 		// release landed when it did not. A resume would believe it.
 		//
-		// On a first synchronization the list is therefore empty, and on a rerun
-		// it holds the consumer branch at whatever the destination actually has.
-		//
-		// The release tag is absent even when it was observed, and that is a
-		// limitation of the record rather than a choice: state.Document requires
-		// every claim about one source commit to name one destination object, and
-		// a release publishes both a branch head and an annotated tag object for
-		// the same upstream commit. Recording both is refused as a contradiction.
-		// The tag is still gated, because the publication plan refuses a tag that
-		// moved whether or not the record mentions it.
+		// On a first synchronization the list is therefore empty. Later plans
+		// preserve every prior branch and tag claim the current remote read
+		// confirmed, then advance a claim only after its consumer push is observed.
+		// Tag correspondence is tracked separately from branch correspondence so
+		// the annotated tag object and branch commit for one source release can both
+		// be recorded without conflating their object identities.
 		Published: r.observedPublished(),
 		Engine: state.Engine{
 			Version:   buildinfo.Version,
@@ -827,23 +837,50 @@ func (r *run) storedRecord(ctx context.Context, doc state.Document) (state.Recor
 
 // observedPublished reports the destination refs this run actually read.
 //
-// Only the consumer branch is expressible, for the reason recorded where it is
-// used, and it is reported only when the destination holds it at a commit this
-// run can account for. A branch holding something else is a destination that
-// moved under the engine; the publication plan is what refuses that, and a
-// record claiming a correspondence it cannot prove would be a second, weaker
-// answer to the same question.
+// The consumer branch is reported when the destination holds it at the commit
+// this run can account for. The release tag is reported when the destination
+// holds it at the tag object this run projected. Tags are excluded from the
+// source-to-destination correspondence check in state.images(), so recording
+// both the branch and the tag for the same source commit does not conflict.
 func (r *run) observedPublished() []state.Published {
-	object, ok := r.observed[r.branchRef()]
-	if !ok || object != r.result.Replay.Heads[0].Destination {
-		return nil
+	byRef := make(map[string]state.Published, len(r.prior.Published)+2)
+
+	// Preserve every prior claim that the current remote read confirmed. A new
+	// release is planned before its consumer refs move, so the honest state for
+	// that plan still describes the previously published branch and tags.
+	for _, prior := range r.prior.Published {
+		if object, ok := r.observed[prior.Ref]; ok && object == prior.Object {
+			byRef[prior.Ref] = prior
+		}
 	}
-	return []state.Published{{
-		Ref:    r.branchRef(),
-		Kind:   state.KindBranch,
-		Object: object,
-		Source: r.opts.Release.Commit,
-	}}
+
+	// When a prior consumer push succeeded, the observed branch may already be
+	// the newly projected head. Record that advancement instead of the older
+	// claim retained above.
+	if object, ok := r.observed[r.branchRef()]; ok && object == r.result.Replay.Heads[0].Destination {
+		byRef[r.branchRef()] = state.Published{
+			Ref:    r.branchRef(),
+			Kind:   state.KindBranch,
+			Object: object,
+			Source: r.opts.Release.Commit,
+		}
+	}
+
+	tagRef := "refs/tags/" + r.result.Release.Tag
+	if object, ok := r.observed[tagRef]; ok && object == r.result.Release.Object {
+		byRef[tagRef] = state.Published{
+			Ref:    tagRef,
+			Kind:   state.KindTag,
+			Object: object,
+			Source: r.opts.Release.Commit,
+		}
+	}
+
+	published := make([]state.Published, 0, len(byRef))
+	for _, entry := range byRef {
+		published = append(published, entry)
+	}
+	return published
 }
 
 // plan asks the publisher what publishing this run's objects would do.

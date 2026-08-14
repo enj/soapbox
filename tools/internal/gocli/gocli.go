@@ -64,7 +64,11 @@ const ProxyOff = "off"
 //   - GOWORK=off keeps a workspace file found above the module directory from
 //     silently replacing the module being resolved.
 //   - GOFLAGS is emptied because it can inject any flag into any command,
-//     including -mod=mod, which turns a read into a rewrite of go.mod.
+//     including -mod=mod, which turns a read into a rewrite of go.mod. The
+//     one exception is Options.ModCacheRW, which appends GOFLAGS=-modcacherw
+//     after the fixed empty entry to make the module cache writable. That is
+//     a typed boolean rather than an open string, so an arbitrary flag still
+//     cannot reach the subprocess through this route.
 //   - GOPRIVATE, GONOPROXY, GONOSUMDB, and GOINSECURE are emptied rather than
 //     set, because each one is a list of exemptions: empty means no module is
 //     exempt from the proxy and the checksum database, which is the safe
@@ -186,6 +190,12 @@ type Options struct {
 	// Secrets holds additional exact values that must never appear in captured
 	// output.
 	Secrets []string
+	// ModCacheRW makes the module cache writable by setting GOFLAGS=-modcacherw.
+	// Without it the go command marks downloaded modules read-only, which is
+	// correct for production but prevents test cleanup on container file systems
+	// where chmod is restricted. This field is the only way to inject GOFLAGS,
+	// and it carries a single well-understood flag rather than an open string.
+	ModCacheRW bool
 	// OutputLimit bounds the bytes one command may return on each stream. Zero
 	// means DefaultOutputLimit and a negative value is rejected.
 	OutputLimit int64
@@ -204,6 +214,7 @@ type Runner struct {
 	inherited   []string
 	isolation   []string
 	proxy       string
+	modCacheRW  bool
 	env         []string
 	outputLimit int64
 	redactor    *gitcli.Redactor
@@ -261,7 +272,8 @@ func New(ctx context.Context, opts Options) (*Runner, error) {
 		inherited:   inherited,
 		isolation:   slices.Clone(opts.Isolation),
 		proxy:       proxy,
-		env:         assembleEnv(inherited, opts.Isolation, opts.Env, proxy),
+		modCacheRW:  opts.ModCacheRW,
+		env:         assembleEnv(inherited, opts.Isolation, opts.Env, proxy, opts.ModCacheRW),
 		outputLimit: limit,
 		// The proxy is seeded alongside the environment values because a proxy
 		// URL is a normal place for a token to live.
@@ -458,12 +470,17 @@ func inheritedEnv(inherit []string) []string {
 // the end is what makes them fixed: no inherited value and no caller entry can
 // reach the subprocess ahead of them. Validation refuses those entries too, so
 // the ordering is a second lock rather than the only one.
-func assembleEnv(inherited, isolation, extra []string, proxy string) []string {
-	env := make([]string, 0, len(inherited)+len(isolation)+len(extra)+len(fixedEnv)+1)
+func assembleEnv(inherited, isolation, extra []string, proxy string, modCacheRW bool) []string {
+	env := make([]string, 0, len(inherited)+len(isolation)+len(extra)+len(fixedEnv)+2)
 	env = append(env, inherited...)
 	env = append(env, isolation...)
 	env = append(env, extra...)
 	env = append(env, fixedEnv...)
+	if modCacheRW {
+		// Override the fixed GOFLAGS= with the single safe flag that makes
+		// the module cache writable. It is appended last so it wins.
+		env = append(env, "GOFLAGS=-modcacherw")
+	}
 	return append(env, proxyVariable+"="+proxy)
 }
 

@@ -9,7 +9,7 @@ import (
 	"github.com/enj/soapbox/tools/internal/gitcli"
 )
 
-// testSecret stands in for an installation token that reached a remote URL by
+// testSecret stands in for a credential that reached a remote URL by
 // mistake. Nothing this package renders may echo it.
 const testSecret = "ghs_notarealtokenvalue00000"
 

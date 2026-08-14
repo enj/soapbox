@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -205,11 +206,21 @@ func TestRepositoryProfileRoundTrips(t *testing.T) {
 	if got, want := cfg.Deny.Imports, []string{"k8s.io/kubernetes/pkg/apis/rbac"}; len(got) != 1 || got[0] != want[0] {
 		t.Fatalf("deny imports = %v, want %v", got, want)
 	}
-	if len(cfg.Dependencies.CopyPackages) != 0 {
-		t.Fatalf("copy packages = %v, want none", cfg.Dependencies.CopyPackages)
+	if len(cfg.Dependencies.CopyPackages) != 1 {
+		t.Fatalf("copy packages = %v, want one", cfg.Dependencies.CopyPackages)
 	}
-	if cfg.Dependencies.Policy != config.DependencyPolicyExternal {
+	if cfg.Dependencies.CopyPackages[0] != "staging/src/k8s.io/component-helpers/auth/rbac/validation" {
+		t.Fatalf("copy package = %q", cfg.Dependencies.CopyPackages[0])
+	}
+	if cfg.Dependencies.Policy != config.DependencyPolicyCopyApproved {
 		t.Fatalf("dependency policy = %q", cfg.Dependencies.Policy)
+	}
+	wantForbidden := []string{"k8s.io/apiserver", "k8s.io/component-helpers"}
+	if !slices.Equal(cfg.Dependencies.ForbiddenModules, wantForbidden) {
+		t.Fatalf("forbidden modules = %v, want %v", cfg.Dependencies.ForbiddenModules, wantForbidden)
+	}
+	if cfg.Compatibility.Apiserver != config.CompatibilityApiserverLocal {
+		t.Fatalf("apiserver compatibility = %q, want local", cfg.Compatibility.Apiserver)
 	}
 	if cfg.Types.Policy != config.TypePolicyPreferExternal {
 		t.Fatalf("type policy = %q", cfg.Types.Policy)

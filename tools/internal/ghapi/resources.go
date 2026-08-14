@@ -121,60 +121,6 @@ type commentRequest struct {
 	Body string `json:"body"`
 }
 
-// InstallationTokenRequest narrows a minted installation token.
-//
-// GitHub mints a token carrying the installation's full grant when neither
-// field is set. Naming the repositories and permissions a run actually needs
-// makes the token itself least privilege, so a token that escapes is bounded by
-// more than the promise that the engine will not misuse it.
-type InstallationTokenRequest struct {
-	// Repositories are bare repository names, without an owner, all belonging
-	// to the account the App is installed on.
-	Repositories []string `json:"repositories,omitempty"`
-
-	// Permissions maps a permission name to read, write, or admin. It may only
-	// narrow what the installation already holds.
-	Permissions map[string]string `json:"permissions,omitempty"`
-}
-
-// InstallationToken is a minted installation access token and its grant.
-//
-// Token is a live credential. It is returned here because this is the boundary
-// that minted it, and internal/ghapp is the only caller: that package stores it
-// behind a narrow accessor and seeds a redactor with it before anything else
-// reads the response.
-type InstallationToken struct {
-	Token               string            `json:"token"`
-	ExpiresAt           time.Time         `json:"expires_at"`
-	Permissions         map[string]string `json:"permissions"`
-	RepositorySelection string            `json:"repository_selection"`
-	Repositories        []Repository      `json:"repositories"`
-}
-
-// String renders the grant without the secret, so a token that reaches a %v by
-// mistake prints what it is allowed to do rather than what it is.
-func (t InstallationToken) String() string {
-	return fmt.Sprintf("installation token (expires %s, selection %q, %d permissions, %d repositories)",
-		t.ExpiresAt.UTC().Format(time.RFC3339), t.RepositorySelection, len(t.Permissions), len(t.Repositories))
-}
-
-// CreateInstallationToken mints an installation access token.
-//
-// The credential this call presents is a GitHub App JWT rather than an
-// installation token, so the client it is made on must be authorized with one.
-func (c *Client) CreateInstallationToken(ctx context.Context, installationID int64, req InstallationTokenRequest) (InstallationToken, error) {
-	if installationID <= 0 {
-		return InstallationToken{}, fmt.Errorf("github installation token: installation id %d must be positive", installationID)
-	}
-	for _, name := range req.Repositories {
-		if err := validateName("repository", name); err != nil {
-			return InstallationToken{}, fmt.Errorf("github installation token: %w", err)
-		}
-	}
-	segments := []string{"app", "installations", strconv.FormatInt(installationID, 10), "access_tokens"}
-	return request[InstallationToken](ctx, c, http.MethodPost, segments, nil, req)
-}
-
 // Repository reads one repository's metadata, including its default branch.
 func (c *Client) Repository(ctx context.Context, owner, name string) (Repository, error) {
 	if err := validateRepository(owner, name); err != nil {
@@ -193,34 +139,6 @@ func (c *Client) DefaultBranch(ctx context.Context, owner, name string) (string,
 		return "", fmt.Errorf("github repository %s/%s: reported no default branch", owner, name)
 	}
 	return repository.DefaultBranch, nil
-}
-
-// installationRepositoryPage is one page of the installation listing.
-type installationRepositoryPage struct {
-	TotalCount   int          `json:"total_count"`
-	Repositories []Repository `json:"repositories"`
-}
-
-// InstallationRepositories lists every repository the presented installation
-// token can reach. It answers the question a publishing run asks before it
-// writes anything: is the App installed where this run expects it to be.
-func (c *Client) InstallationRepositories(ctx context.Context) ([]Repository, error) {
-	var all []Repository
-	for page := 1; page <= maxPages; page++ {
-		query := url.Values{
-			"per_page": {strconv.Itoa(pageSize)},
-			"page":     {strconv.Itoa(page)},
-		}
-		got, err := request[installationRepositoryPage](ctx, c, http.MethodGet, []string{"installation", "repositories"}, query, nil)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, got.Repositories...)
-		if len(got.Repositories) < pageSize || len(all) >= got.TotalCount {
-			return all, nil
-		}
-	}
-	return nil, fmt.Errorf("github installation repositories: listing did not end within %d pages", maxPages)
 }
 
 // Workflow reads one Actions workflow by its file name, such as sync.yml.

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"golang.org/x/mod/modfile"
+
+	"github.com/enj/soapbox/tools/internal/gomodmap"
 )
 
 // parseModule parses go.mod text for a comparison test.
@@ -41,7 +43,7 @@ func TestCompare_Unchanged(t *testing.T) {
 	t.Parallel()
 
 	intended := parseModule(t, generatedModule)
-	report, err := compare(intended, parseModule(t, generatedModule))
+	report, err := compare(intended, parseModule(t, generatedModule), false)
 	if err != nil {
 		t.Fatalf("compare: %v", err)
 	}
@@ -84,7 +86,7 @@ godebug default=go1.26
 
 require k8s.io/api v0.36.1
 `
-	report, err := compare(parseModule(t, generatedModule), parseModule(t, tidied))
+	report, err := compare(parseModule(t, generatedModule), parseModule(t, tidied), false)
 	if err != nil {
 		t.Fatalf("compare: %v", err)
 	}
@@ -94,6 +96,25 @@ require k8s.io/api v0.36.1
 	}
 	if len(report.Kept) != 1 || report.Kept[0].Path != "k8s.io/api" {
 		t.Errorf("kept = %v, want only k8s.io/api", report.Kept)
+	}
+}
+
+func TestCompare_AllowsAndReportsCompatibilityAdditions(t *testing.T) {
+	t.Parallel()
+	tidied := generatedModule + "\nrequire github.com/kr/text v0.2.0 // indirect\n"
+	report, err := compare(parseModule(t, generatedModule), parseModule(t, tidied), true)
+	if err != nil {
+		t.Fatalf("compare with allowed additions: %v", err)
+	}
+	want := []gomodmap.Requirement{{Path: "github.com/kr/text", Version: "v0.2.0", Indirect: true}}
+	if !slices.Equal(report.Added, want) {
+		t.Errorf("added = %#v, want %#v", report.Added, want)
+	}
+	if !slices.Contains(report.Kept, want[0]) {
+		t.Errorf("kept = %#v, want added requirement included", report.Kept)
+	}
+	if _, err := compare(parseModule(t, generatedModule), parseModule(t, tidied), false); !errors.Is(err, ErrModuleDrift) {
+		t.Errorf("ordinary compare = %v, want ErrModuleDrift", err)
 	}
 }
 
@@ -122,7 +143,7 @@ require (
 	k8s.io/klog/v2 v2.130.1
 )
 `
-	report, err := compare(parseModule(t, generatedModule), parseModule(t, tidied))
+	report, err := compare(parseModule(t, generatedModule), parseModule(t, tidied), false)
 	if err != nil {
 		t.Fatalf("compare: %v", err)
 	}
@@ -157,7 +178,7 @@ func TestCompare_Floated(t *testing.T) {
 	t.Parallel()
 
 	tidied := strings.Replace(generatedModule, "k8s.io/api v0.36.1", "k8s.io/api v0.36.4", 1)
-	_, err := compare(parseModule(t, generatedModule), parseModule(t, tidied))
+	_, err := compare(parseModule(t, generatedModule), parseModule(t, tidied), false)
 	if !errors.Is(err, ErrPinFloated) {
 		t.Fatalf("compare: error = %v, want ErrPinFloated", err)
 	}
@@ -229,7 +250,7 @@ func TestCompare_Drift(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := compare(parseModule(t, generatedModule), parseModule(t, test.tidied))
+			_, err := compare(parseModule(t, generatedModule), parseModule(t, test.tidied), false)
 			if !errors.Is(err, ErrModuleDrift) {
 				t.Fatalf("compare: error = %v, want ErrModuleDrift", err)
 			}
@@ -255,7 +276,7 @@ godebug default=go1.26
 
 require k8s.io/api v0.36.9
 `
-	_, err := compare(parseModule(t, generatedModule), parseModule(t, tidied))
+	_, err := compare(parseModule(t, generatedModule), parseModule(t, tidied), false)
 	if !errors.Is(err, ErrPinFloated) {
 		t.Errorf("compare: error = %v, want ErrPinFloated", err)
 	}

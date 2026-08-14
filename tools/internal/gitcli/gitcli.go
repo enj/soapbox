@@ -143,6 +143,10 @@ type Options struct {
 	// Secrets holds additional exact values that must never appear in captured
 	// output.
 	Secrets []string
+	// gitConfig is typed per-command configuration assembled by package-owned
+	// credential helpers. Keeping it private prevents arbitrary callers from
+	// bypassing validation or forgetting redaction.
+	gitConfig []gitConfig
 	// OutputLimit bounds the bytes one command may return on a stream. Zero
 	// means DefaultOutputLimit and a negative value is rejected.
 	OutputLimit int64
@@ -205,6 +209,9 @@ func New(ctx context.Context, opts Options) (*Runner, error) {
 			return nil, fmt.Errorf("git runner: %w", err)
 		}
 	}
+	if err := validateGitConfig(opts.gitConfig); err != nil {
+		return nil, fmt.Errorf("git runner: %w", err)
+	}
 	limit := opts.OutputLimit
 	switch {
 	case limit < 0:
@@ -214,13 +221,14 @@ func New(ctx context.Context, opts Options) (*Runner, error) {
 	}
 	inherited := inheritedEnv(opts.Inherit)
 	isolation := slices.Clone(opts.Isolation)
+	runtimeEnv := append(slices.Clone(opts.Env), gitConfigEnv(opts.gitConfig)...)
 	return &Runner{
 		binary:      binary,
 		dir:         opts.Dir,
-		env:         assembleEnv(inherited, isolation, opts.Env),
+		env:         assembleEnv(inherited, isolation, runtimeEnv),
 		inherited:   inherited,
 		isolation:   isolation,
-		anonymous:   len(opts.Env) == 0,
+		anonymous:   len(opts.Env) == 0 && len(opts.gitConfig) == 0,
 		outputLimit: limit,
 		redactor:    NewRedactor(append(envValues(opts.Env), opts.Secrets...)...),
 	}, nil

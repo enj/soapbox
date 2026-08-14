@@ -645,7 +645,7 @@ func planProfileDir(t *testing.T, _ *planUpstream) string {
 }
 
 // planProfile is a complete profile for the command level fixture.
-const planProfile = `version: 1
+const planProfile = `version: 2
 source:
   repository: https://github.com/kubernetes/kubernetes.git
   importPrefix: k8s.io/kubernetes
@@ -694,6 +694,7 @@ types:
 dependencies:
   policy: external
   copyPackages: []
+  forbiddenModules: []
   gates:
     interoperability: true
     globalState: true
@@ -732,11 +733,10 @@ vanity:
   importPath: monis.app/kk/fixture
   repositoryURL: https://github.com/enj/fixture
   probeURL: https://monis.app/kk/fixture?go-get=1
-githubApp:
-  appIDEnv: SOAPBOX_GITHUB_APP_ID
-  installationIDEnv: SOAPBOX_GITHUB_INSTALLATION_ID
-  privateKeyEnv: SOAPBOX_GITHUB_APP_PRIVATE_KEY
-  apiBaseURL: https://api.github.com
+publication:
+  mode: automatic
+compatibility:
+  apiserver: external
 determinism:
   toolchain: go1.26.5
   chunkSize: 200

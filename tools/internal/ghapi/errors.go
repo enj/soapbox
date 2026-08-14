@@ -16,13 +16,13 @@ var (
 	// ErrUnauthorized reports that GitHub rejected the credential itself.
 	ErrUnauthorized = errors.New("github rejected the credential")
 
-	// ErrForbidden reports that the credential is valid but not permitted to do
-	// this. For a GitHub App this is normally a missing installation permission.
+	// ErrForbidden reports that the credential is valid but lacks the required
+	// repository or workflow permission.
 	ErrForbidden = errors.New("github refused the request")
 
-	// ErrNotFound reports that GitHub has no such resource. An App that is not
-	// installed on a repository is answered this way rather than with a refusal,
-	// so a caller cannot tell the two apart from the status alone.
+	// ErrNotFound reports that GitHub has no visible such resource. A resource
+	// hidden from the credential can be answered this way rather than with a
+	// refusal, so a caller cannot tell the two apart from the status alone.
 	ErrNotFound = errors.New("github reports no such resource")
 
 	// ErrRateLimited reports a primary or secondary rate limit. The error also

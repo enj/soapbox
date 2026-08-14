@@ -242,6 +242,9 @@ func (r *run) acquireSource(ctx context.Context) error {
 		refs.Tags = []string{r.opts.Ref.Name}
 	case RefBranch:
 		refs.Branches = []string{r.opts.Ref.Name}
+	case RefCommit:
+		// Exact commits are resolved from the already-fetched object database
+		// below. Options validation refuses Fetch for this engine-only kind.
 	}
 	if r.opts.Fetch && !r.opts.Offline {
 		if err := cache.Fetch(ctx, refs); err != nil {
@@ -258,14 +261,23 @@ func (r *run) acquireSource(ctx context.Context) error {
 		r.report.Source.Fetched = true
 	}
 
-	resolved, err := cache.Resolve(ctx, refs)
-	if err != nil {
-		// A ref the cache does not hold is a statement about the profile and the
-		// upstream repository, not about this machine.
-		return contentPolicy("plan source", err)
+	var resolved []source.Revision
+	if r.opts.Ref.Kind == RefCommit {
+		revision, resolveErr := cache.ResolveCommit(ctx, r.opts.Ref.Name)
+		if resolveErr != nil {
+			return fmt.Errorf("plan source: %w", resolveErr)
+		}
+		resolved = []source.Revision{revision}
+	} else {
+		resolved, err = cache.Resolve(ctx, refs)
+		if err != nil {
+			// A ref the cache does not hold is a statement about the profile and the
+			// upstream repository, not about this machine.
+			return contentPolicy("plan source", err)
+		}
 	}
 	if len(resolved) != 1 {
-		return fmt.Errorf("plan source: resolved %d refs, want exactly one", len(resolved))
+		return fmt.Errorf("plan source: resolved %d selections, want exactly one", len(resolved))
 	}
 	r.revision = resolved[0]
 	r.report.Source.RefKind = string(r.opts.Ref.Kind)
@@ -301,7 +313,7 @@ func (r *run) verifyAnchor(ctx context.Context) error {
 	// The anchor is resolved before it is compared, so a profile naming an
 	// object this repository does not hold is reported as the profile finding
 	// it is rather than as an ancestry check that could not run.
-	if _, err := r.cache.Git().ResolveCommit(ctx, anchor); err != nil {
+	if _, err := r.cache.ResolveCommit(ctx, anchor); err != nil {
 		return contentPolicy("plan anchor", err)
 	}
 	descends, err := r.cache.Git().IsAncestor(ctx, anchor, r.revision.Commit)

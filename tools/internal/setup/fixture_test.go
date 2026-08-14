@@ -161,10 +161,10 @@ func engineSumFor(version string) []byte {
 
 // fixtureProfile is a complete, valid extraction profile. Setup reads only the
 // destination module, the branch, the facade file names, the internal prefix,
-// the toolchain, and the App secret names from it, but the profile has to
+// the toolchain, and the publication mode from it, but the profile has to
 // validate as a whole for the command to reach setup at all.
 const fixtureProfile = `
-version: 1
+version: 2
 
 source:
   repository: https://github.com/kubernetes/kubernetes.git
@@ -223,6 +223,7 @@ types:
 dependencies:
   policy: external
   copyPackages: []
+  forbiddenModules: []
   gates:
     interoperability: true
     globalState: true
@@ -271,11 +272,11 @@ vanity:
   repositoryURL: https://github.com/enj/rbac_authorizer
   probeURL: https://monis.app/kk/rbac_authorizer?go-get=1
 
-githubApp:
-  appIDEnv: SOAPBOX_GITHUB_APP_ID
-  installationIDEnv: SOAPBOX_GITHUB_INSTALLATION_ID
-  privateKeyEnv: SOAPBOX_GITHUB_APP_PRIVATE_KEY
-  apiBaseURL: https://api.github.com
+publication:
+  mode: automatic
+
+compatibility:
+  apiserver: local
 
 determinism:
   toolchain: go1.26.5

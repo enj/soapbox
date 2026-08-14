@@ -172,7 +172,8 @@ func TestRerunningACompletedSynchronizationReachesAFixedPoint(t *testing.T) {
 		t.Errorf("the first record claims %v is published, want nothing: it observed an empty destination", published)
 	}
 
-	// The first rerun resumes from the published record, as a scheduled job does.
+	// The first rerun resumes from the published record, as a scheduled job does,
+	// and records both consumer refs it now observes.
 	second := dest.rerun(ctx, t, first.Manifest.Objects.StateCommit)
 	consumerRefs := map[string]bool{testBranchRef: true, "refs/tags/" + testReleaseTag: true}
 	for _, action := range second.Manifest.Publish.Actions {
@@ -181,8 +182,8 @@ func TestRerunningACompletedSynchronizationReachesAFixedPoint(t *testing.T) {
 				action.Ref, action.Effect, publish.EffectNoOp)
 		}
 	}
-	if got := len(second.Document.Published); got != 1 {
-		t.Errorf("the rerun records %d published refs, want 1: it observed the branch it published", got)
+	if got := len(second.Document.Published); got != 2 {
+		t.Errorf("the rerun records %d published refs, want 2: it observed the branch and tag it published", got)
 	}
 	applied, err := sync.Apply(ctx, second, sync.ApplyOptions{Approval: second.Manifest.Hash})
 	if err != nil {

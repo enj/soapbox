@@ -275,16 +275,6 @@ func TestValidateRefusals(t *testing.T) {
 				},
 				want: state.ErrCorrespondence,
 			}, {
-				name: "a cursor and a published tag that disagree about one source",
-				mutate: func(d *state.Document) {
-					d.Published[0].Kind = state.KindTag
-					d.Published[0].Ref = "refs/tags/v0.36.1"
-					d.Published[0].Source = d.Cursors[0].Source
-					d.Published[0].Object = sha(format, "somewhere else")
-				},
-				want:    state.ErrCorrespondence,
-				message: "cursor refs/heads/master",
-			}, {
 				name: "a cursor and a published branch that disagree about one destination",
 				mutate: func(d *state.Document) {
 					d.Published[0].Object = d.Cursors[0].Destination
@@ -743,4 +733,82 @@ func TestDocumentRecordsNoTime(t *testing.T) {
 		}
 	}
 	walk(reflect.TypeFor[state.Document](), "Document")
+}
+
+// TestPublishedTagMayShareSourceWithCursor proves that a KindTag Published
+// entry may carry the same Source as a cursor while naming its annotated tag
+// object as Object. Before the KindTag exclusion in images(), this was a
+// correspondence conflict because one source mapped to two different
+// destination objects (the branch commit and the tag object).
+func TestPublishedTagMayShareSourceWithCursor(t *testing.T) {
+	for _, format := range objectFormats {
+		t.Run(string(format), func(t *testing.T) {
+			doc := base(format)
+			sharedSource := sha(format, "shared-source")
+			branchCommit := sha(format, "branch-commit")
+			tagObject := sha(format, "tag-object")
+
+			doc.Anchor.Source = sharedSource
+			doc.Epoch.Source = sharedSource
+			doc.Cursors = []state.Cursor{{
+				Ref:         "refs/heads/master",
+				Source:      sharedSource,
+				Destination: branchCommit,
+			}}
+			doc.Published = []state.Published{{
+				Ref:    "refs/heads/main",
+				Kind:   state.KindBranch,
+				Source: sharedSource,
+				Object: branchCommit,
+			}, {
+				Ref:    "refs/tags/v0.36.1",
+				Kind:   state.KindTag,
+				Source: sharedSource,
+				Object: tagObject,
+			}}
+			canonical, err := state.New(doc)
+			if err != nil {
+				t.Fatalf("state.New: %v", err)
+			}
+			if err := canonical.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+		})
+	}
+}
+
+func TestPublishedTagsRequireOneToOneCorrespondence(t *testing.T) {
+	for _, format := range objectFormats {
+		t.Run(string(format), func(t *testing.T) {
+			tests := []struct {
+				name string
+				tags []state.Published
+			}{
+				{
+					name: "one source cannot name two tag objects",
+					tags: []state.Published{
+						{Ref: "refs/tags/v0.36.1", Kind: state.KindTag, Source: sha(format, "source"), Object: sha(format, "tag-one")},
+						{Ref: "refs/tags/v0.36.2", Kind: state.KindTag, Source: sha(format, "source"), Object: sha(format, "tag-two")},
+					},
+				},
+				{
+					name: "one tag object cannot name two sources",
+					tags: []state.Published{
+						{Ref: "refs/tags/v0.36.1", Kind: state.KindTag, Source: sha(format, "source-one"), Object: sha(format, "tag")},
+						{Ref: "refs/tags/v0.36.2", Kind: state.KindTag, Source: sha(format, "source-two"), Object: sha(format, "tag")},
+					},
+				},
+			}
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					doc := base(format)
+					doc.Published = test.tags
+					_, err := state.New(doc)
+					if !errors.Is(err, state.ErrCorrespondence) {
+						t.Fatalf("state.New = %v, want correspondence error", err)
+					}
+				})
+			}
+		})
+	}
 }

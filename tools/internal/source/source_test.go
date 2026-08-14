@@ -452,6 +452,52 @@ func TestResolve(t *testing.T) {
 	}
 }
 
+func TestResolveCommitUsesOnlyAnAlreadyFetchedObject(t *testing.T) {
+	ctx := t.Context()
+	up := newUpstream(ctx, t)
+	cache := openCache(ctx, t, up)
+	if err := cache.Fetch(ctx, allRefs); err != nil {
+		t.Fatalf("fetch refs: %v", err)
+	}
+
+	revision, err := cache.ResolveCommit(ctx, up.release)
+	if err != nil {
+		t.Fatalf("resolve exact commit: %v", err)
+	}
+	if revision.Kind != source.KindCommit || revision.Name != up.release ||
+		revision.Ref != up.release || revision.Object != up.release || revision.Commit != up.release {
+		t.Fatalf("revision = %#v, want exact commit %s", revision, up.release)
+	}
+	if revision.Annotated {
+		t.Fatal("an exact commit was reported as an annotated tag")
+	}
+
+	blob, err := cache.Git().WriteBlob(ctx, []byte("not a commit"))
+	if err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+	tests := []struct {
+		name   string
+		commit string
+		want   string
+	}{
+		{name: "malformed object name", commit: "abc123", want: "40 or 64 hexadecimal"},
+		{name: "missing object", commit: strings.Repeat("f", 40), want: "missing from the cache"},
+		{name: "wrong object type", commit: blob, want: "blob, not a commit"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := cache.ResolveCommit(ctx, test.commit)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error %q does not contain %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestResolveRejectsUnusableRefs(t *testing.T) {
 	ctx := t.Context()
 	up := newUpstream(ctx, t)

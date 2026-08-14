@@ -177,6 +177,9 @@ const (
 	ChangeNotice ChangeKind = "notice"
 	// ChangeProtoOption is a rewritten proto go_package option.
 	ChangeProtoOption ChangeKind = "proto-option"
+	// ChangeCompatibility is an intentional API or implementation edit selected
+	// by an output compatibility mode.
+	ChangeCompatibility ChangeKind = "compatibility"
 )
 
 // Change is one recorded transformation. The change report is what a

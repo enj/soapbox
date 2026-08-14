@@ -8,10 +8,10 @@
 // leaves the configured origin is refused rather than followed, because
 // following one would offer the header to a host the engine did not choose.
 //
-// This package sits below internal/ghapp rather than above it. ghapp mints the
-// installation tokens this client presents, and mints them through this client,
-// so the base URL rules, the redirect refusal, the response size bound, and the
-// typed errors all cover the token endpoint too.
+// This package provides the typed HTTP boundary for authenticated GitHub API
+// calls. The token is supplied by an Authorizer and set as one Authorization
+// header on the outgoing request, so the base URL rules, the redirect refusal,
+// the response size bound, and the typed errors all cover every endpoint.
 package ghapi
 
 import (
@@ -77,10 +77,9 @@ const maxRedirects = 5
 
 // Authorizer supplies the Authorization header value for one request.
 //
-// It is an interface rather than a token string because a GitHub App credential
-// expires, and a client that captured one at construction would present a dead
-// token an hour later. Asking per request lets the provider renew underneath,
-// and lets this package stay ignorant of how the credential is minted.
+// It is an interface rather than a token string so the client remains ignorant
+// of how a credential is sourced and tests can fail a request before transport.
+// The production GITHUB_TOKEN implementation is static for one workflow job.
 type Authorizer interface {
 	AuthorizationHeader(ctx context.Context) (string, error)
 }
@@ -94,8 +93,8 @@ func (f AuthorizerFunc) AuthorizationHeader(ctx context.Context) (string, error)
 // Config describes one GitHub REST client.
 type Config struct {
 	// Authorizer supplies the credential presented on every request. It is
-	// required: this client exists to reach an installation's repositories, and
-	// an anonymous client would silently read the public view of them instead.
+	// required because an anonymous client could silently read a public subset
+	// instead of the authenticated repository view the caller intends.
 	Authorizer Authorizer
 
 	// BaseURL is the REST API root. It defaults to DefaultBaseURL and must be an
@@ -423,10 +422,8 @@ func request[T any](ctx context.Context, c *Client, method string, segments []st
 		return decoded, nil
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
-		// The error carries the decoder's complaint but never the bytes that
-		// caused it. The one response in the engine that holds a secret is the
-		// installation token, and a rule that let some bodies into a message
-		// would have to be right every time about which body it was holding.
+		// The error carries the decoder's complaint but never the server-controlled
+		// response bytes, which may contain private repository data.
 		return decoded, fmt.Errorf("github %s %s: decode response: %w", method, route, err)
 	}
 	return decoded, nil

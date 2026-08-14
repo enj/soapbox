@@ -180,6 +180,9 @@ type Export struct {
 	// because the relocated path is derived from it by a rule this package
 	// applies rather than by a second thing to keep in sync.
 	Source string
+	// Direct marks a generated module-local declaration. It is never accepted
+	// from a user profile; an engine compatibility phase derives it.
+	Direct bool
 	// Doc is an optional documentation sentence for the generated declaration.
 	// It is rendered above the declaration, after the provenance line the
 	// generator always writes.
@@ -203,8 +206,11 @@ type Assertion struct {
 	// Interface is the qualified interface, such as
 	// k8s.io/apiserver/pkg/authorization/authorizer.Authorizer. It is an
 	// external module path used verbatim: an assertion against a copy of the
-	// interface would prove nothing about the real one.
+	// interface would prove nothing about the real one in external mode.
 	Interface string
+	// Local permits a compatibility-mode assertion against an engine-generated
+	// module-local interface. User-authored assertions never set it.
+	Local bool
 }
 
 // Spec is the config derived description of the facade to generate.
@@ -339,9 +345,17 @@ func (s Spec) resolveExport(export Export) (resolvedExport, error) {
 	if err != nil {
 		return resolvedExport{}, fmt.Errorf("export %s: %w", export.Name, err)
 	}
-	relocated, err := s.relocate(upstream)
-	if err != nil {
-		return resolvedExport{}, fmt.Errorf("export %s: %w", export.Name, err)
+	relocated := upstream
+	if export.Direct {
+		root := path.Join(s.ModulePath, s.InternalPrefix) + "/"
+		if !strings.HasPrefix(upstream, root) {
+			return resolvedExport{}, fmt.Errorf("%w: direct package %q is not below generated internal root %s", ErrSpec, upstream, root)
+		}
+	} else {
+		relocated, err = s.relocate(upstream)
+		if err != nil {
+			return resolvedExport{}, fmt.Errorf("export %s: %w", export.Name, err)
+		}
 	}
 	return resolvedExport{Export: export, Package: relocated, Symbol: symbol}, nil
 }
@@ -367,9 +381,13 @@ func (s Spec) resolveAssertions(exports []resolvedExport) ([]resolvedAssertion, 
 		if err != nil {
 			return nil, fmt.Errorf("assertion on %s: %w", assertion.Type, err)
 		}
-		if pkgPath == s.ModulePath || strings.HasPrefix(pkgPath, s.ModulePath+"/") {
+		insideModule := pkgPath == s.ModulePath || strings.HasPrefix(pkgPath, s.ModulePath+"/")
+		switch {
+		case insideModule && !assertion.Local:
 			return nil, fmt.Errorf("%w: assertion on %s names %s, which is inside the generated module; an assertion against a copied interface proves nothing about the real one",
 				ErrSpec, assertion.Type, assertion.Interface)
+		case assertion.Local && !strings.HasPrefix(pkgPath, path.Join(s.ModulePath, s.InternalPrefix)+"/"):
+			return nil, fmt.Errorf("%w: local assertion on %s names %s outside the generated internal root", ErrSpec, assertion.Type, assertion.Interface)
 		}
 		assertions = append(assertions, resolvedAssertion{Assertion: assertion, Package: pkgPath, Symbol: symbol})
 	}

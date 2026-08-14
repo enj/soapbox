@@ -60,6 +60,38 @@ func TestSyncDecidesUsageBeforeReadingTheProfile(t *testing.T) {
 		name:       "offline contradicted by a proxy",
 		args:       []string{"sync", cache, destination, "-offline", "-proxy=https://proxy.golang.org"},
 		wantStderr: "cannot also be requested",
+	}, {
+		name:       "unattended contradicts apply",
+		args:       []string{"sync", cache, destination, "-unattended", "-apply"},
+		wantStderr: "-unattended self-approves, so -apply cannot also be given",
+	}, {
+		name:       "unattended contradicts approve",
+		args:       []string{"sync", cache, destination, "-unattended", "-approve=sha256:whatever"},
+		wantStderr: "-unattended self-approves, so -approve cannot also be given",
+	}, {
+		name:       "unattended contradicts local-remote",
+		args:       []string{"sync", cache, destination, "-unattended", "-local-remote"},
+		wantStderr: "-unattended publishes over HTTPS, so -local-remote cannot also be given",
+	}, {
+		name:       "unattended contradicts remote override",
+		args:       []string{"sync", cache, destination, "-unattended", "-remote=https://example.com/x.git"},
+		wantStderr: "-unattended derives the remote from the profile, so -remote cannot also be given",
+	}, {
+		name:       "unattended contradicts identity override",
+		args:       []string{"sync", cache, destination, "-unattended", "-identity=github.com/other/repo"},
+		wantStderr: "-unattended derives the identity from the profile, so -identity cannot also be given",
+	}, {
+		name:       "unattended contradicts state-commit override",
+		args:       []string{"sync", cache, destination, "-unattended", "-state-commit=abc123"},
+		wantStderr: "-unattended discovers state from the destination, so -state-commit cannot also be given",
+	}, {
+		name:       "unattended contradicts tag override",
+		args:       []string{"sync", cache, destination, "-unattended", "-tag=v1.36.1"},
+		wantStderr: "-unattended discovers releases from the source, so -tag cannot also be given",
+	}, {
+		name:       "unattended contradicts source-remote override",
+		args:       []string{"sync", cache, destination, "-unattended", "-source-remote=https://example.com/k.git"},
+		wantStderr: "-unattended derives the source from the profile, so -source-remote cannot also be given",
 	}}
 
 	for _, tt := range tests {
@@ -94,6 +126,7 @@ func TestSyncIsDispatchableAndDocumented(t *testing.T) {
 	for _, flag := range []string{
 		"-destination string", "-remote string", "-identity string",
 		"-local-remote", "-state-commit string", "-apply", "-approve string",
+		"-unattended",
 	} {
 		if !strings.Contains(stdout, flag) {
 			t.Errorf("sync help does not document %q", flag)

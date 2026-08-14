@@ -55,9 +55,9 @@ func licenseNames() []string {
 	return names
 }
 
-// statesGrant reports whether a collected file is the one that states the
+// StatesGrant reports whether a collected file is the one that states the
 // licence, which is the only kind whose text can verify an identifier.
-func statesGrant(name string) bool {
+func StatesGrant(name string) bool {
 	stem := strings.TrimSuffix(strings.TrimSuffix(name, ".md"), ".txt")
 	return slices.Contains(grantStems, stem)
 }
@@ -227,7 +227,7 @@ func (c CopiedPackage) validate() error {
 		// PATENTS file travel with it but state neither the permission nor the
 		// conditions, so verifying the identifier against one of them would
 		// prove nothing.
-		if !statesGrant(license.Name) {
+		if !StatesGrant(license.Name) {
 			continue
 		}
 		if err := VerifyLicense(c.LicenseID, license.Contents); err != nil {
@@ -294,7 +294,7 @@ func Collect(ctx context.Context, opts CollectOptions) ([]LicenseFile, error) {
 		if err := checkRelative(pkg, "copied package"); err != nil {
 			return nil, fmt.Errorf("licence collection: %w", err)
 		}
-		if pkg != opts.ModuleRoot && !strings.HasPrefix(pkg, opts.ModuleRoot+"/") {
+		if pkg != opts.ModuleRoot && opts.ModuleRoot != "." && !strings.HasPrefix(pkg, opts.ModuleRoot+"/") {
 			return nil, fmt.Errorf("licence collection: package %q is not inside module root %q: %w", pkg, opts.ModuleRoot, ErrOptions)
 		}
 		if err := collectFrom(opts, pkg, collected); err != nil {

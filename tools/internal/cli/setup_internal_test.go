@@ -42,16 +42,22 @@ func TestGeneratedWorkflowCommandsNameRealFlags(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fields := strings.Fields(test.command)
-			// The invocation runs one Go program with the engine's own command
-			// name, which is what "one Go command" in the workflow means.
-			if len(fields) < 4 || fields[0] != "go" || fields[1] != "run" || fields[2] != "./cmd/soapbox" {
-				t.Fatalf("command %q is not a go run of the engine shim", test.command)
+			// Find the verb in the command. For go-run commands the verb is
+			// after the module path; for pre-built binaries the verb follows
+			// the binary path (which may contain ${{ }} expressions that
+			// split into multiple fields).
+			verbIndex := -1
+			for i, f := range fields {
+				if f == test.verb {
+					verbIndex = i
+					break
+				}
 			}
-			if fields[3] != test.verb {
-				t.Fatalf("command %q runs %q, want %q", test.command, fields[3], test.verb)
+			if verbIndex < 0 {
+				t.Fatalf("command %q does not contain verb %q", test.command, test.verb)
 			}
 			named := 0
-			for _, field := range fields[4:] {
+			for _, field := range fields[verbIndex+1:] {
 				if !strings.HasPrefix(field, "-") {
 					continue
 				}
@@ -71,14 +77,14 @@ func TestGeneratedWorkflowCommandsNameRealFlags(t *testing.T) {
 	}
 }
 
-// TestSyncWorkflowCommandPublishesNothing keeps the generated schedule from
-// becoming an outward action by accident. Publication is enabled deliberately,
-// at the outward-action gate, and not by a template this package ships.
-func TestSyncWorkflowCommandPublishesNothing(t *testing.T) {
+// TestSyncBaseCommandCarriesNoApproval asserts the base sync invocation embeds
+// no explicit approval flag. Automatic mode adds -unattended at generation
+// time; the base command itself must not carry a stale or hardcoded approval.
+func TestSyncBaseCommandCarriesNoApproval(t *testing.T) {
 	fields := strings.Fields(setup.SyncCommand)
 	for _, forbidden := range []string{"-apply", "-approve"} {
 		if slices.Contains(fields, forbidden) {
-			t.Errorf("the generated sync workflow names %s", forbidden)
+			t.Errorf("the base sync command names %s", forbidden)
 		}
 	}
 }

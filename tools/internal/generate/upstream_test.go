@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/mod/module"
+
 	"github.com/enj/soapbox/tools/internal/gitcli"
 	"github.com/enj/soapbox/tools/internal/gomodmap"
 	"github.com/enj/soapbox/tools/internal/testsupport"
@@ -24,8 +26,9 @@ import (
 // at v0.36.1 would be indistinguishable from the real one and either would serve
 // the other. A domain nothing publishes under cannot collide.
 const (
-	stagingAPI       = "soapbox.test/api"
-	stagingAPIServer = "soapbox.test/apiserver"
+	stagingAPI              = "soapbox.test/api"
+	stagingAPIServer        = "soapbox.test/apiserver"
+	stagingComponentHelpers = "soapbox.test/component-helpers"
 )
 
 // upstreamFiles is the miniature Kubernetes-shaped source tree every end-to-end
@@ -46,11 +49,14 @@ var upstreamFiles = map[string]string{
 		"require (\n" +
 		"\t" + stagingAPI + " v0.0.0\n" +
 		"\t" + stagingAPIServer + " v0.0.0\n" +
+		"\t" + stagingComponentHelpers + " v0.0.0\n" +
 		")\n" +
 		"\n" +
 		"replace " + stagingAPI + " => ./staging/src/" + stagingAPI + "\n" +
 		"\n" +
-		"replace " + stagingAPIServer + " => ./staging/src/" + stagingAPIServer + "\n",
+		"replace " + stagingAPIServer + " => ./staging/src/" + stagingAPIServer + "\n" +
+		"\n" +
+		"replace " + stagingComponentHelpers + " => ./staging/src/" + stagingComponentHelpers + "\n",
 
 	"LICENSE": fixtureLicense,
 	"NOTICE":  fixtureNotice,
@@ -61,6 +67,9 @@ var upstreamFiles = map[string]string{
 	"staging/src/" + stagingAPIServer + "/go.mod":                                     "module " + stagingAPIServer + "\n\ngo 1.26.0\n",
 	"staging/src/" + stagingAPIServer + "/LICENSE":                                    fixtureLicense,
 	"staging/src/" + stagingAPIServer + "/pkg/authorization/authorizer/interfaces.go": stagingAuthorizer,
+	"staging/src/" + stagingComponentHelpers + "/go.mod":                              "module " + stagingComponentHelpers + "\n\ngo 1.26.0\n" + "require " + stagingAPI + " v0.0.0\n" + "replace " + stagingAPI + " => ../../" + stagingAPI + "\n",
+	"staging/src/" + stagingComponentHelpers + "/LICENSE":                             fixtureLicense,
+	"staging/src/" + stagingComponentHelpers + "/text/policy/matcher.go":              stagingPolicyMatcher,
 
 	"plugin/pkg/auth/authorizer/rbac/rbac.go":     upstreamRBAC,
 	"pkg/registry/rbac/validation/rule.go":        upstreamValidation,
@@ -84,9 +93,15 @@ var proxyModules = map[string]map[string]string{
 		"rbac/v1/types.go": stagingAPITypes,
 	},
 	stagingAPIServer: {
-		"go.mod":  "module " + stagingAPIServer + "\n\ngo 1.26.0\n",
-		"LICENSE": fixtureLicense,
+		"go.mod":                          "module " + stagingAPIServer + "\n\ngo 1.26.0\n",
+		"LICENSE":                         fixtureLicense,
+		"pkg/authentication/user/user.go": stagingUser,
 		"pkg/authorization/authorizer/interfaces.go": stagingAuthorizer,
+	},
+	stagingComponentHelpers: {
+		"go.mod":                 "module " + stagingComponentHelpers + "\n\ngo 1.26.0\n\nrequire " + stagingAPI + " v0.36.1\n",
+		"LICENSE":                fixtureLicense,
+		"text/policy/matcher.go": stagingPolicyMatcher,
 	},
 }
 
@@ -96,8 +111,9 @@ var proxyModules = map[string]map[string]string{
 // a release tag still names what it named before, and a fixture that generated
 // them would produce a different report on every run.
 var stagingCommits = map[string]string{
-	stagingAPI:       "1111111111111111111111111111111111111111",
-	stagingAPIServer: "2222222222222222222222222222222222222222",
+	stagingAPI:              "1111111111111111111111111111111111111111",
+	stagingAPIServer:        "2222222222222222222222222222222222222222",
+	stagingComponentHelpers: "3333333333333333333333333333333333333333",
 }
 
 const stagingAPITypes = `package v1
@@ -115,9 +131,40 @@ type Role struct {
 }
 `
 
+const stagingPolicyMatcher = `package policy
+
+import rbacv1 "` + stagingAPI + `/rbac/v1"
+
+// MatchesVerb reports whether any policy rule in the set covers the verb.
+func MatchesVerb(rules []rbacv1.PolicyRule, verb string) bool {
+	for i := range rules {
+		for _, v := range rules[i].Verbs {
+			if v == "*" || v == verb {
+				return true
+			}
+		}
+	}
+	return false
+}
+`
+
+const stagingUser = `package user
+
+// Info describes an authenticated subject.
+type Info interface {
+	GetName() string
+	GetUID() string
+	GetGroups() []string
+	GetExtra() map[string][]string
+}
+`
+
 const stagingAuthorizer = `package authorizer
 
-import "context"
+import (
+	"context"
+	"` + stagingAPIServer + `/pkg/authentication/user"
+)
 
 // Decision is the outcome of one authorization.
 type Decision int
@@ -133,7 +180,7 @@ const (
 
 // Attributes describe the request being authorized.
 type Attributes interface {
-	GetUser() string
+	GetUser() user.Info
 	GetVerb() string
 }
 
@@ -180,11 +227,13 @@ const upstreamValidation = `package validation
 import (
 	rbachelpers "k8s.io/kubernetes/pkg/apis/rbac/v1"
 	rbacv1 "` + stagingAPI + `/rbac/v1"
+	"` + stagingAPIServer + `/pkg/authentication/user"
+	"` + stagingComponentHelpers + `/text/policy"
 )
 
 // AuthorizationRuleResolver resolves the rules that apply to a subject.
 type AuthorizationRuleResolver interface {
-	RulesFor(user string) ([]rbacv1.PolicyRule, error)
+	RulesFor(user.Info) ([]rbacv1.PolicyRule, error)
 }
 
 // RoleGetter retrieves roles by name.
@@ -203,8 +252,8 @@ func NewDefaultRuleResolver(roles RoleGetter) *DefaultRuleResolver {
 }
 
 // RulesFor returns the rules bound to the subject.
-func (r *DefaultRuleResolver) RulesFor(user string) ([]rbacv1.PolicyRule, error) {
-	role, err := r.roles.GetRole(user)
+func (r *DefaultRuleResolver) RulesFor(subject user.Info) ([]rbacv1.PolicyRule, error) {
+	role, err := r.roles.GetRole(subject.GetName())
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +262,9 @@ func (r *DefaultRuleResolver) RulesFor(user string) ([]rbacv1.PolicyRule, error)
 
 // RuleAllows reports whether any rule covers the verb.
 func RuleAllows(rules []rbacv1.PolicyRule, verb string) bool {
+	if policy.MatchesVerb(rules, verb) {
+		return true
+	}
 	for i := range rules {
 		if rbachelpers.VerbMatches(&rules[i], verb) {
 			return true
@@ -398,13 +450,13 @@ func newProxy(t *testing.T) string {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), "proxy")
 	for modulePath, files := range proxyModules {
-		writeProxyModule(t, root, modulePath, fixtureStagingTag, files)
+		writeProxyModule(t, root, modulePath, fixtureStagingTag, stagingCommits[modulePath], files)
 	}
 	return root
 }
 
 // writeProxyModule lays out one module version in the proxy's directory format.
-func writeProxyModule(t *testing.T, root, modulePath, version string, files map[string]string) {
+func writeProxyModule(t *testing.T, root, modulePath, version, commit string, files map[string]string) {
 	t.Helper()
 	dir := filepath.Join(root, filepath.FromSlash(modulePath), "@v")
 	if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -417,9 +469,35 @@ func writeProxyModule(t *testing.T, root, modulePath, version string, files map[
 			t.Fatalf("proxy file %s: %v", name, err)
 		}
 	}
-	write("list", version+"\n")
-	// The timestamp is a literal so the proxy is a pure function of the fixture.
-	write(version+".info", `{"Version":"`+version+`","Time":"2026-01-02T03:04:05Z"}`)
+	versions := map[string]bool{version: true}
+	if existing, err := os.ReadFile(filepath.Join(dir, "list")); err == nil {
+		for _, listed := range strings.Fields(string(existing)) {
+			versions[listed] = true
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("read proxy version list: %v", err)
+	}
+	orderedVersions := make([]string, 0, len(versions))
+	for listed := range versions {
+		orderedVersions = append(orderedVersions, listed)
+	}
+	slices.Sort(orderedVersions)
+	write("list", strings.Join(orderedVersions, "\n")+"\n")
+	// The .info includes Origin so the go command populates Module.Origin,
+	// which the copy materializer validates against the pinned staging commit.
+	// The basename derives the canonical staging repo URL the same way the
+	// validation does.
+	basename := modulePath
+	if idx := strings.LastIndex(modulePath, "/"); idx >= 0 {
+		basename = modulePath[idx+1:]
+	}
+	repoURL := "https://github.com/kubernetes/" + basename
+	originRef := `,"Ref":"refs/tags/` + version + `"`
+	if module.IsPseudoVersion(version) {
+		originRef = ""
+	}
+	info := `{"Version":"` + version + `","Time":"2026-01-02T03:04:05Z","Origin":{"VCS":"git","URL":"` + repoURL + `","Hash":"` + commit + `"` + originRef + `}}`
+	write(version+".info", info)
 	write(version+".mod", files["go.mod"])
 
 	var buf bytes.Buffer
@@ -467,7 +545,7 @@ func writeVersionIndex(ctx context.Context, t *testing.T, path, commit string) {
 	}
 	index := gomodmap.NewIndex()
 	modules := make([]gomodmap.ModuleVersion, 0, len(stagingCommits))
-	for _, modulePath := range []string{stagingAPI, stagingAPIServer} {
+	for _, modulePath := range []string{stagingAPI, stagingAPIServer, stagingComponentHelpers} {
 		modules = append(modules, gomodmap.ModuleVersion{
 			Path:    modulePath,
 			Version: fixtureStagingTag,
@@ -482,14 +560,18 @@ func writeVersionIndex(ctx context.Context, t *testing.T, path, commit string) {
 	}
 }
 
-// removeAllForced removes a tree the go command made read-only.
+// removeAllForced removes a tree the go command may have made read-only.
 //
-// The module cache is written without write permission so a build cannot mutate
-// a downloaded module in place, which also means an ordinary removal cannot
-// unlink it. Restoring write permission on the way down is what lets a test
-// clean up after itself.
+// It first tries a plain removal, which succeeds when -modcacherw was in
+// effect. Only when that fails does it walk the tree restoring write
+// permission, which is needed for a cache written without that flag.
 func removeAllForced(root string) error {
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	err := os.RemoveAll(root)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	// Restore write permission and retry.
+	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -498,8 +580,8 @@ func removeAllForced(root string) error {
 		}
 		return os.Chmod(path, 0o600)
 	})
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("relax %s: %w", root, err)
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		return fmt.Errorf("relax %s: %w", root, walkErr)
 	}
 	return os.RemoveAll(root)
 }
@@ -516,7 +598,7 @@ const goSumDBVariable = "GOSUMDB"
 
 // stagingPaths renders the staging module paths the fixture provides, sorted.
 func stagingPaths() []string {
-	paths := []string{stagingAPI, stagingAPIServer}
+	paths := []string{stagingAPI, stagingAPIServer, stagingComponentHelpers}
 	slices.Sort(paths)
 	return paths
 }

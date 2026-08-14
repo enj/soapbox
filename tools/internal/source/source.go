@@ -69,15 +69,20 @@ type Kind string
 const (
 	KindBranch Kind = "branch"
 	KindTag    Kind = "tag"
+	// KindCommit is an engine-only exact commit already present in the cache.
+	// Unlike a branch or tag it is never fetched by name.
+	KindCommit Kind = "commit"
 )
 
-// Revision is one resolved upstream ref.
+// Revision is one resolved upstream ref or exact cached commit.
 type Revision struct {
-	// Name is the short ref name, such as master or v1.36.1.
+	// Name is the short ref name, such as master or v1.36.1, or the full object
+	// name for KindCommit.
 	Name string
-	// Ref is the fully qualified ref name.
+	// Ref is the fully qualified ref name. For KindCommit it is the full object
+	// name because no ref names the selection.
 	Ref string
-	// Kind reports which namespace the ref lives in.
+	// Kind reports which namespace the selection lives in.
 	Kind Kind
 	// Object is what the ref points at, which is the tag object itself for an
 	// annotated tag.
@@ -645,6 +650,36 @@ func (c *Cache) Resolve(ctx context.Context, refs Refs) ([]Revision, error) {
 		}
 	}
 	return resolved, nil
+}
+
+// ResolveCommit selects one exact commit that a prior ref fetch placed in the
+// cache. It never performs a lazy fetch: a missing object means the caller did
+// not establish the release-bounded source history it intends to replay.
+func (c *Cache) ResolveCommit(ctx context.Context, commit string) (Revision, error) {
+	if err := gitgraph.ValidateSHA(commit); err != nil {
+		return Revision{}, fmt.Errorf("source commit: %w", err)
+	}
+	infos, err := c.git.ObjectInfoBatch(ctx, gitcli.ObjectInfoOptions{Revisions: []string{commit}})
+	if err != nil {
+		return Revision{}, fmt.Errorf("source commit %s: %w", commit, err)
+	}
+	if len(infos) != 1 {
+		return Revision{}, fmt.Errorf("source commit %s: object probe returned %d records, want 1", commit, len(infos))
+	}
+	info := infos[0]
+	switch {
+	case info.Missing:
+		return Revision{}, fmt.Errorf("source commit %s is missing from the cache", commit)
+	case info.Type != "commit":
+		return Revision{}, fmt.Errorf("source commit %s resolves to a %s, not a commit", commit, info.Type)
+	}
+	return Revision{
+		Name:   commit,
+		Ref:    commit,
+		Kind:   KindCommit,
+		Object: commit,
+		Commit: commit,
+	}, nil
 }
 
 // ListBranches reports every cached branch, ordered by ref name.

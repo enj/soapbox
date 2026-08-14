@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/enj/soapbox/tools/internal/config"
 	"github.com/enj/soapbox/tools/internal/setup"
 )
 
@@ -148,15 +149,30 @@ func TestGeneratedWorkflowsAreLeastPrivilege(t *testing.T) {
 		}
 	})
 
-	t.Run("sync runs unattended and only from the default branch", func(t *testing.T) {
+	t.Run("sync runs unattended and only from the protected default branch", func(t *testing.T) {
 		if _, ok := sync.On["workflow_dispatch"]; !ok {
 			t.Error("sync cannot be dispatched manually")
 		}
 		if _, ok := sync.On["pull_request"]; ok {
 			t.Error("sync runs on pull requests")
 		}
-		if want := "github.ref == 'refs/heads/main'"; sync.Jobs["sync"].If != want {
+		if want := "github.ref == 'refs/heads/main' && github.ref_protected"; sync.Jobs["sync"].If != want {
 			t.Errorf("sync guard = %q, want %q", sync.Jobs["sync"].If, want)
+		}
+	})
+
+	t.Run("sync checkout fetches full history while CI stays shallow", func(t *testing.T) {
+		syncJob := sync.Jobs["sync"]
+		syncDepth := checkoutWith(t, syncJob, "fetch-depth")
+		if syncDepth != 0 {
+			t.Errorf("sync checkout fetch-depth = %v, want 0", syncDepth)
+		}
+		if got := checkoutWith(t, syncJob, "persist-credentials"); got != false {
+			t.Errorf("sync checkout persist-credentials = %v, want false", got)
+		}
+		ciJob := ci.Jobs["verify"]
+		if got := checkoutWith(t, ciJob, "persist-credentials"); got != false {
+			t.Errorf("ci checkout persist-credentials = %v, want false", got)
 		}
 	})
 
@@ -197,32 +213,31 @@ func TestGeneratedWorkflowsAreLeastPrivilege(t *testing.T) {
 		}
 	})
 
-	t.Run("sync writes with the App token and not the workflow token", func(t *testing.T) {
+	t.Run("sync writes with the workflow token", func(t *testing.T) {
 		job := sync.Jobs["sync"]
-		for permission, level := range job.Permissions {
-			if level == "write" {
-				t.Errorf("sync grants the workflow token %s: write, which no step uses", permission)
-			}
+		if job.Permissions["contents"] != "write" {
+			t.Errorf("sync permissions = %v, want contents: write", job.Permissions)
 		}
-		if job.Permissions["contents"] != "read" || job.Permissions["actions"] != "read" {
-			t.Errorf("sync permissions = %v, want contents and actions read", job.Permissions)
+		if job.Permissions["actions"] != "read" {
+			t.Errorf("sync permissions = %v, want actions: read", job.Permissions)
+		}
+		if len(job.Permissions) != 2 {
+			t.Errorf("sync permissions = %v, want exactly contents and actions", job.Permissions)
 		}
 	})
 
-	t.Run("sync exports exactly the profile's App secrets", func(t *testing.T) {
+	t.Run("sync exports the GITHUB_TOKEN", func(t *testing.T) {
 		var exported map[string]string
 		for _, step := range sync.Jobs["sync"].Steps {
 			if len(step.Env) > 0 {
 				if exported != nil {
-					t.Fatal("more than one sync step exports secrets")
+					t.Fatal("more than one sync step exports environment variables")
 				}
 				exported = step.Env
 			}
 		}
 		want := map[string]string{
-			"SOAPBOX_GITHUB_APP_ID":          "${{ secrets.SOAPBOX_GITHUB_APP_ID }}",
-			"SOAPBOX_GITHUB_INSTALLATION_ID": "${{ secrets.SOAPBOX_GITHUB_INSTALLATION_ID }}",
-			"SOAPBOX_GITHUB_APP_PRIVATE_KEY": "${{ secrets.SOAPBOX_GITHUB_APP_PRIVATE_KEY }}",
+			"SOAPBOX_GITHUB_TOKEN": "${{ github.token }}",
 		}
 		if len(exported) != len(want) {
 			t.Fatalf("sync exports %v, want %v", exported, want)
@@ -234,24 +249,42 @@ func TestGeneratedWorkflowsAreLeastPrivilege(t *testing.T) {
 		}
 	})
 
-	t.Run("sync runs one Go command and publishes nothing by default", func(t *testing.T) {
+	t.Run("sync builds without token and runs with token", func(t *testing.T) {
 		var commands []string
+		var tokenSteps []string
 		for _, step := range sync.Jobs["sync"].Steps {
 			if step.Run != "" {
 				commands = append(commands, step.Run)
+				if len(step.Env) > 0 {
+					tokenSteps = append(tokenSteps, step.Run)
+				}
 			}
 		}
-		if len(commands) != 1 {
-			t.Fatalf("sync runs %d commands, want exactly one: %q", len(commands), commands)
+		if len(commands) != 2 {
+			t.Fatalf("sync runs %d commands, want exactly two (build + run): %q", len(commands), commands)
 		}
-		if !strings.HasPrefix(commands[0], "go run ") {
-			t.Errorf("sync command = %q, want one Go invocation", commands[0])
+		// First command builds without token.
+		if !strings.HasPrefix(commands[0], "go build ") {
+			t.Errorf("first command = %q, want go build", commands[0])
 		}
-		if strings.Contains(commands[0], "-apply") {
+		// Second command runs the pre-built binary with -unattended (automatic mode).
+		if !strings.Contains(commands[1], "-unattended") {
+			t.Error("the automatic mode sync workflow does not pass -unattended")
+		}
+		if strings.Contains(commands[1], "-apply") {
 			t.Error("the generated sync workflow publishes without an approval")
 		}
-		if strings.ContainsAny(commands[0], "|&;<>()") {
-			t.Errorf("sync command %q composes shell rather than running one program", commands[0])
+		// Only the run step receives the token.
+		if len(tokenSteps) != 1 {
+			t.Fatalf("expected exactly one step with SOAPBOX_GITHUB_TOKEN, got %d", len(tokenSteps))
+		}
+		if strings.HasPrefix(tokenSteps[0], "go build") {
+			t.Error("the build step should not receive the token")
+		}
+		for _, cmd := range commands {
+			if strings.ContainsAny(cmd, "|&;<>()") {
+				t.Errorf("command %q composes shell rather than running one program", cmd)
+			}
 		}
 	})
 }
@@ -299,4 +332,131 @@ func keysOf[V any](m map[string]V) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// TestManualModeWorkflow covers a profile with publication.mode=manual.
+func TestManualModeWorkflow(t *testing.T) {
+	ctx := t.Context()
+
+	// Build a template with a manual-mode profile.
+	manualProfile := strings.Replace(fixtureProfile, "mode: automatic", "mode: manual", 1)
+	root, git := newTemplate(ctx, t, map[string]string{
+		config.DefaultFileName: manualProfile,
+	})
+	opts := newOptions(ctx, t, root, git)
+	planned := plan(ctx, t, opts)
+	if _, err := setup.Apply(ctx, opts, planned.Report.Hash); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	sync := decodeWorkflow(t, filepath.Join(root, ".github", "workflows", "sync.yml"))
+
+	t.Run("manual mode does not pass -unattended", func(t *testing.T) {
+		var commands []string
+		for _, step := range sync.Jobs["sync"].Steps {
+			if step.Run != "" {
+				commands = append(commands, step.Run)
+			}
+		}
+		if len(commands) != 2 {
+			t.Fatalf("sync runs %d commands, want exactly two (build + run): %q", len(commands), commands)
+		}
+		// The run step (second command) must not have -unattended or -apply.
+		runCmd := commands[1]
+		if strings.Contains(runCmd, "-unattended") {
+			t.Error("the manual mode sync workflow passes -unattended")
+		}
+		if strings.Contains(runCmd, "-apply") {
+			t.Error("the manual mode sync workflow publishes without an approval")
+		}
+	})
+
+	t.Run("manual mode accepts an environment-only approval input", func(t *testing.T) {
+		dispatch, ok := sync.On["workflow_dispatch"].(map[string]any)
+		if !ok {
+			t.Fatalf("workflow_dispatch = %#v, want a mapping", sync.On["workflow_dispatch"])
+		}
+		inputs, ok := dispatch["inputs"].(map[string]any)
+		if !ok {
+			t.Fatalf("workflow_dispatch inputs = %#v", dispatch["inputs"])
+		}
+		approve, ok := inputs["approve"].(map[string]any)
+		if !ok || approve["type"] != "string" || approve["required"] != false {
+			t.Fatalf("approve input = %#v, want an optional string", inputs["approve"])
+		}
+		raw := readFile(t, filepath.Join(root, ".github", "workflows", "sync.yml"))
+		if strings.Contains(raw, "-approve") || strings.Contains(raw, "${{ inputs.approve }}'") {
+			t.Fatal("manual approval is interpolated into the command line")
+		}
+	})
+
+	t.Run("manual mode exports token and approval", func(t *testing.T) {
+		var exported map[string]string
+		for _, step := range sync.Jobs["sync"].Steps {
+			if len(step.Env) > 0 {
+				exported = step.Env
+			}
+		}
+		want := map[string]string{
+			"SOAPBOX_GITHUB_TOKEN": "${{ github.token }}",
+			"SOAPBOX_APPROVAL":     "${{ inputs.approve }}",
+		}
+		if len(exported) != len(want) {
+			t.Fatalf("sync exports %v, want %v", exported, want)
+		}
+		for name, value := range want {
+			if exported[name] != value {
+				t.Errorf("sync exports %s = %q, want %q", name, exported[name], value)
+			}
+		}
+	})
+
+	t.Run("manual mode has contents:write and actions:read", func(t *testing.T) {
+		job := sync.Jobs["sync"]
+		if job.Permissions["contents"] != "write" {
+			t.Errorf("sync permissions = %v, want contents: write", job.Permissions)
+		}
+		if job.Permissions["actions"] != "read" {
+			t.Errorf("sync permissions = %v, want actions: read", job.Permissions)
+		}
+		if len(job.Permissions) != 2 {
+			t.Errorf("sync permissions = %v, want exactly contents and actions", job.Permissions)
+		}
+	})
+
+	t.Run("manual mode has the ref_protected guard", func(t *testing.T) {
+		if want := "github.ref == 'refs/heads/main' && github.ref_protected"; sync.Jobs["sync"].If != want {
+			t.Errorf("sync guard = %q, want %q", sync.Jobs["sync"].If, want)
+		}
+	})
+
+	t.Run("manual mode pins every action", func(t *testing.T) {
+		for _, job := range sync.Jobs {
+			for _, step := range job.Steps {
+				if step.Uses == "" {
+					continue
+				}
+				if !pinnedUses.MatchString(step.Uses) {
+					t.Errorf("step %q uses %q, which is not a full commit pin", step.Name, step.Uses)
+				}
+			}
+		}
+	})
+
+	t.Run("manual mode has no id-token permission", func(t *testing.T) {
+		job := sync.Jobs["sync"]
+		if _, ok := job.Permissions["id-token"]; ok {
+			t.Error("sync job has id-token permission")
+		}
+		if len(sync.Permissions) != 0 {
+			t.Errorf("sync grants %v at the top level, want none", sync.Permissions)
+		}
+	})
+
+	t.Run("manual mode has no App secrets", func(t *testing.T) {
+		raw := readFile(t, filepath.Join(root, ".github", "workflows", "sync.yml"))
+		if strings.Contains(raw, "secrets.") {
+			t.Error("manual mode sync names a secret")
+		}
+	})
 }

@@ -140,6 +140,10 @@ func setupCommand() command {
 	return command{name: "setup", summary: "transform this template checkout into one derived repository", run: runSetup}
 }
 
+func upgradeCommand() command {
+	return command{name: "upgrade", summary: "upgrade setup-owned files in a derived repository to a new engine release", run: runUpgrade}
+}
+
 func helpCommand() command {
 	return command{name: "help", summary: "print usage for soapbox or one command", run: runHelp}
 }
@@ -148,7 +152,7 @@ func helpCommand() command {
 func commands() []command {
 	return []command{
 		doctorCommand(), validateCommand(), planCommand(), generateCommand(),
-		syncCommand(), setupCommand(), versionCommand(), helpCommand(),
+		syncCommand(), setupCommand(), upgradeCommand(), versionCommand(), helpCommand(),
 	}
 }
 
@@ -442,6 +446,8 @@ func runHelp(_ context.Context, env Env, args []string) error {
 			fs, _ = syncFlagSet()
 		case "setup":
 			fs, _ = setupFlagSet()
+		case "upgrade":
+			fs, _ = upgradeFlagSet()
 		default:
 			fs = newFlagSet(cmd.name)
 		}

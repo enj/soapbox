@@ -2,7 +2,8 @@ package generate_test
 
 import (
 	"context"
-	"errors"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,8 +11,18 @@ import (
 	"testing"
 
 	"github.com/enj/soapbox/tools/internal/config"
+	"github.com/enj/soapbox/tools/internal/extract"
 	"github.com/enj/soapbox/tools/internal/generate"
+	"github.com/enj/soapbox/tools/internal/gitcli"
 	"github.com/enj/soapbox/tools/internal/gocli"
+	"github.com/enj/soapbox/tools/internal/gomodmap"
+	"github.com/enj/soapbox/tools/internal/publish"
+	enginerelease "github.com/enj/soapbox/tools/internal/release"
+	"github.com/enj/soapbox/tools/internal/replay"
+	"github.com/enj/soapbox/tools/internal/source"
+	"github.com/enj/soapbox/tools/internal/state"
+	enginesync "github.com/enj/soapbox/tools/internal/sync"
+	"github.com/enj/soapbox/tools/internal/testsupport"
 	"github.com/enj/soapbox/tools/internal/typeswap"
 )
 
@@ -65,6 +76,79 @@ func newEndToEndWith(ctx context.Context, t *testing.T, overrides map[string]str
 	return &endToEnd{upstream: up, proxy: proxy, roots: dirs, opts: opts}
 }
 
+func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToEnd, releaseTags ...string) map[string]generate.StagingSource {
+	t.Helper()
+	stagingTag := fixtureStagingTag
+	if len(releaseTags) > 0 {
+		stagingTag = releaseTags[0]
+	}
+	modulePaths := make([]string, 0, len(proxyModules))
+	for modulePath := range proxyModules {
+		modulePaths = append(modulePaths, modulePath)
+	}
+	slices.Sort(modulePaths)
+
+	sources := make(map[string]generate.StagingSource, len(modulePaths))
+	commits := make(map[string]string, len(modulePaths))
+	pseudos := make(map[string]string, len(modulePaths))
+	for _, modulePath := range modulePaths {
+		repo := testsupport.NewRepo(ctx, t, testsupport.Options{
+			Branch:    "master",
+			UserName:  "Kubernetes Publishing Bot",
+			UserEmail: "k8s-publishing-bot@users.noreply.github.com",
+		})
+		repo.SetConfig(ctx, t, "uploadpack.allowFilter", "true")
+		commit := repo.WriteAndCommit(ctx, t, "published.txt", modulePath+"\n",
+			"publish staging module\n\n"+gomodmap.KubernetesCommitTrailer+": "+e.upstream.commit+"\n")
+		tagger := gitcli.Signature{
+			Name:  "Kubernetes Publishing Bot",
+			Email: "k8s-publishing-bot@users.noreply.github.com",
+			Date:  "2026-01-02T03:04:05Z",
+		}
+		if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
+			Name: stagingTag, Commit: commit, Message: "staging " + stagingTag + "\n", Tagger: tagger,
+		}); err != nil {
+			t.Fatalf("tag staging module %s: %v", modulePath, err)
+		}
+		if stagingTag != fixtureStagingTag {
+			if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
+				Name: fixtureStagingTag, Commit: commit,
+				Message: "staging " + fixtureStagingTag + "\n", Tagger: tagger,
+			}); err != nil {
+				t.Fatalf("tag staging module %s anchor: %v", modulePath, err)
+			}
+		}
+		commits[modulePath] = commit
+		pseudos[modulePath] = "v0.0.0-20260102030405-" + commit[:12]
+		sources[modulePath] = generate.StagingSource{Remote: "file://" + repo.Dir}
+	}
+
+	for _, modulePath := range modulePaths {
+		files := make(map[string]string, len(proxyModules[modulePath]))
+		for name, contents := range proxyModules[modulePath] {
+			files[name] = contents
+		}
+		// The real intermediate component-helpers module depends on the API
+		// pseudo-version from the same publication wave. Keep the fixture coherent
+		// so minimal version selection proves the pins rather than raising one.
+		if modulePath == stagingComponentHelpers {
+			files["go.mod"] = strings.ReplaceAll(files["go.mod"], fixtureStagingTag, pseudos[stagingAPI])
+		}
+		commit := commits[modulePath]
+		pseudo := pseudos[modulePath]
+		writeProxyModule(t, e.proxy, modulePath, pseudo, commit, files)
+		versionDir := filepath.Join(e.proxy, filepath.FromSlash(modulePath), "@v")
+		info, err := os.ReadFile(filepath.Join(versionDir, pseudo+".info"))
+		if err != nil {
+			t.Fatalf("read pseudo-version info for %s: %v", modulePath, err)
+		}
+		if err := os.WriteFile(filepath.Join(versionDir, commit+".info"), info, 0o600); err != nil {
+			t.Fatalf("write commit query info for %s: %v", modulePath, err)
+		}
+	}
+	return sources
+}
+
 // relayout prepares a second generation over the same upstream commit with
 // entirely different directories.
 //
@@ -116,10 +200,11 @@ func fixtureGo(t *testing.T, proxy string) *gocli.Runner {
 	}
 
 	runner, err := gocli.New(t.Context(), gocli.Options{
-		Dir:       t.TempDir(),
-		Inherit:   []string{"PATH", goSumDBVariable},
-		Isolation: isolation,
-		Proxy:     "file://" + filepath.ToSlash(proxy),
+		Dir:        t.TempDir(),
+		Inherit:    []string{"PATH", goSumDBVariable},
+		Isolation:  isolation,
+		Proxy:      "file://" + filepath.ToSlash(proxy),
+		ModCacheRW: true,
 	})
 	if err != nil {
 		t.Fatalf("go runner: %v", err)
@@ -252,16 +337,12 @@ func TestGenerateRefusesAnUnprovableSubstitution(t *testing.T) {
 	}
 }
 
-// TestGenerateRefusesCopyProposalsAsUnsupported proves a profile that proposes a
-// staging copy is refused rather than silently generating a module whose
-// provenance would describe files the tree does not contain.
-//
-// The dependency decision itself is implemented and tested elsewhere. What is
-// missing is everything a copy needs afterwards: reading the staging package out
-// of the upstream tree, relocating it beside the extracted code, collecting the
-// grant that governs it, and recording all of it in the root evidence. Refusing
-// is the only answer that does not publish a claim nothing backs.
-func TestGenerateRefusesCopyProposalsAsUnsupported(t *testing.T) {
+// TestGenerateRefusedCopyProposalStillSucceeds proves a profile that proposes a
+// staging copy whose candidate is refused by correctness gates still produces a
+// valid module. The authorizer package cannot be copied because the facade
+// asserts its interface, so the identity gate refuses it. The decision records
+// the refusal and the generation completes with zero copies.
+func TestGenerateRefusedCopyProposalStillSucceeds(t *testing.T) {
 	ctx := t.Context()
 	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
 		cfg.Dependencies.Policy = config.DependencyPolicyCopyApproved
@@ -271,24 +352,362 @@ func TestGenerateRefusesCopyProposalsAsUnsupported(t *testing.T) {
 		cfg.Dependencies.Gates.Cost.MinPackagesRemoved = 1
 	})
 
+	result := e.generateOnce(ctx, t)
+
+	// The proposal is refused by correctness gates, not by the engine.
+	if len(result.Report.Dependencies.Copy) != 0 {
+		t.Errorf("dependency copy = %v, want none (the authorizer should be refused by correctness gates)", result.Report.Dependencies.Copy)
+	}
+	if result.Report.Failure != nil {
+		t.Errorf("generation failed: %s", result.Report.Failure.Message)
+	}
+}
+
+// TestGenerateRefusesForbiddenModule proves a profile that names a staging
+// module as forbidden causes the generation to refuse, even when the module
+// is a legitimate transitive dependency.
+func TestGenerateRefusesForbiddenModule(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+		// The stagingAPI module is a real dependency of the extracted code.
+		// Forbidding it must cause a policy refusal.
+		cfg.Dependencies.ForbiddenModules = []string{stagingAPI}
+	})
+
 	result, err := generateFailure(ctx, t, e.opts)
-	if !errors.Is(err, generate.ErrUnsupported) {
-		t.Errorf("generate: error = %v, want it to be ErrUnsupported", err)
-	}
-	if _, statErr := os.Stat(e.roots.output); !os.IsNotExist(statErr) {
-		t.Errorf("output tree exists after an unsupported copy proposal: %v", statErr)
-	}
 	if result == nil || result.Report.Failure == nil {
-		t.Fatalf("generate: no reviewable report for a copy proposal: %v", err)
+		t.Fatalf("generate: no reviewable report for a forbidden module: %v", err)
 	}
 	if result.Report.Failure.Stage != "dependencies" {
 		t.Errorf("failure stage = %s, want dependencies", result.Report.Failure.Stage)
 	}
-	// The classification is what a caller acts on: this is neither a bad profile
-	// nor a broken engine.
-	if !result.Report.Failure.Unsupported {
-		t.Errorf("failure = %+v, want it classified as unsupported", result.Report.Failure)
+	if !strings.Contains(err.Error(), "forbidden module") {
+		t.Errorf("error = %v, want it to mention forbidden module", err)
 	}
+	if !strings.Contains(err.Error(), stagingAPI) {
+		t.Errorf("error = %v, want it to name the forbidden module %s", err, stagingAPI)
+	}
+}
+
+// TestGenerateCopiesApprovedStagingPackage is the end-to-end staging copy proof.
+//
+// The component-helpers validation package is a pure leaf: no types cross the
+// public boundary, no global state, no diamond, and no build-constrained files.
+// The retained validation/rule.go imports it. After the copy:
+//
+//  1. The copied file appears in the generated tree at the correct relocated path.
+//  2. The retained file's import is rewritten to point at the copy.
+//  3. The component-helpers module requirement drops from go.mod.
+//  4. The post-copy module still type checks (graph reload gate).
+//  5. The dependency report records the copy.
+func TestGenerateCopiesApprovedStagingPackage(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+		cfg.Dependencies.Policy = config.DependencyPolicyCopyApproved
+		cfg.Dependencies.CopyPackages = []string{
+			"staging/src/" + stagingComponentHelpers + "/text/policy",
+		}
+		cfg.Dependencies.Gates.Cost.MaxCopiedPackages = 1
+		cfg.Dependencies.Gates.Cost.MaxCopiedLines = 500
+		cfg.Dependencies.Gates.Cost.MaxGeneratedFiles = 1
+		cfg.Dependencies.Gates.Cost.MaxDistinctLicenses = 1
+		cfg.Dependencies.Gates.Cost.MaxModuleZipBytes = 1 << 20 // 1 MiB ceiling
+		cfg.Dependencies.Gates.Cost.MaxReleasesPerMinor = 10
+		cfg.Dependencies.Gates.Cost.MinModulesRemoved = 1
+		cfg.Dependencies.Gates.Cost.MinPackagesRemoved = 1
+		cfg.Dependencies.Gates.Cost.MinLinesRemoved = 1
+		// The minimumLeverage override is required because go/packages does not
+		// populate Syntax (and therefore countLines returns 0) for packages
+		// resolved through a file proxy, so linesRemoved is unmeasured and the
+		// leverage gate fails on MinLinesRemoved. This is a fixture limitation,
+		// not a materializer bug.
+		cfg.Dependencies.Overrides = []config.DependencyOverride{{
+			Package:       "staging/src/" + stagingComponentHelpers + "/text/policy",
+			Gate:          "minimumLeverage",
+			Justification: "file proxy does not populate go/packages Syntax for deps, so linesRemoved is zero",
+			Approver:      "test",
+			ExpiresAfter:  "v1.99",
+		}}
+	})
+
+	result := e.generateOnce(ctx, t)
+
+	if result.Report.Failure != nil {
+		t.Fatalf("generate: refused at %s: %s", result.Report.Failure.Stage, result.Report.Failure.Message)
+	}
+	for _, c := range result.Report.Dependencies.Candidates {
+		t.Logf("candidate %s: action=%s proposed=%v failed=%v", c.ImportPath, c.Action, c.Proposed, c.FailedGates)
+	}
+
+	// 1. The copied file appears at the correct relocated path.
+	copiedPath := "internal/kk/staging/src/" + stagingComponentHelpers + "/text/policy/matcher.go"
+	got := treePaths(result)
+	if !slices.Contains(got, copiedPath) {
+		t.Errorf("generated tree does not contain the copied file %s, got:\n  %s", copiedPath, joinLines(got))
+	}
+
+	// 2. The retained validation/rule.go import is rewritten to the copy.
+	rulePath := "internal/kk/pkg/registry/rbac/validation/rule.go"
+	ruleContents := fileContents(t, result, rulePath)
+	relocatedImport := e.opts.Config.Destination.Module + "/internal/kk/staging/src/" + stagingComponentHelpers
+	if !strings.Contains(ruleContents, relocatedImport) {
+		t.Errorf("retained rule.go does not import the relocated copy %s:\n%s", relocatedImport, ruleContents)
+	}
+	if strings.Contains(ruleContents, `"`+stagingComponentHelpers+`/`) {
+		t.Errorf("retained rule.go still imports the external staging module %s:\n%s", stagingComponentHelpers, ruleContents)
+	}
+
+	// 3. The component-helpers module requirement dropped from go.mod.
+	goMod := fileContents(t, result, "go.mod")
+	if strings.Contains(goMod, stagingComponentHelpers) {
+		t.Errorf("go.mod still requires the copied staging module %s:\n%s", stagingComponentHelpers, goMod)
+	}
+	// The other staging modules should still be required.
+	if !strings.Contains(goMod, stagingAPI) {
+		t.Errorf("go.mod dropped the still-needed staging module %s:\n%s", stagingAPI, goMod)
+	}
+
+	// 4. The report records the copy.
+	deps := result.Report.Dependencies
+	if len(deps.Copy) != 1 {
+		t.Fatalf("dependency copy = %v, want exactly one staging path", deps.Copy)
+	}
+	if deps.Copy[0] != "staging/src/"+stagingComponentHelpers+"/text/policy" {
+		t.Errorf("copied staging path = %s, want staging/src/%s/text/policy", deps.Copy[0], stagingComponentHelpers)
+	}
+	if deps.Totals.Copied != 1 {
+		t.Errorf("copied total = %d, want 1", deps.Totals.Copied)
+	}
+
+	// 5. The tree was written and what was written matches what was reported.
+	if !result.Report.Output.Materialized {
+		t.Error("report: Materialized = false, want the tree to have been written")
+	}
+	written := walkTree(t, e.roots.output)
+	if !slices.Equal(written, got) {
+		t.Errorf("written tree differs from the reported one:\n written:\n  %s\n reported:\n  %s", joinLines(written), joinLines(got))
+	}
+
+	// 6. The per-package provenance record names the staging module, not the
+	// Kubernetes root repository. The file bytes came from the module cache at
+	// the staging module's pinned version, so the provenance must say so.
+	copiedPkgDir := "internal/kk/staging/src/" + stagingComponentHelpers + "/text/policy"
+	provenancePath := copiedPkgDir + "/SOAPBOX_PROVENANCE.txt"
+	if !slices.Contains(got, provenancePath) {
+		t.Fatalf("generated tree has no provenance record at %s", provenancePath)
+	}
+	provenance := fileContents(t, result, provenancePath)
+	// The provenance names the validated Origin URL (the canonical staging
+	// repo), not the module path or the Kubernetes root repo.
+	expectedOriginURL := "https://github.com/kubernetes/component-helpers"
+	if !strings.Contains(provenance, "upstream repository: "+expectedOriginURL) {
+		t.Errorf("copy provenance does not name the Origin URL %s:\n%s",
+			expectedOriginURL, provenance)
+	}
+	if !strings.Contains(provenance, "upstream commit: "+stagingCommits[stagingComponentHelpers]) {
+		t.Errorf("copy provenance does not name the staging commit %s:\n%s",
+			stagingCommits[stagingComponentHelpers], provenance)
+	}
+	// It must NOT name the Kubernetes root repo — that would be claiming
+	// provenance from a tree the bytes were not read from.
+	if strings.Contains(provenance, "kubernetes/kubernetes") {
+		t.Errorf("copy provenance incorrectly names the Kubernetes root repository:\n%s", provenance)
+	}
+	for _, want := range []string{
+		"upstream package: text/policy",
+		"upstream: text/policy/matcher.go",
+	} {
+		if !strings.Contains(provenance, want) {
+			t.Errorf("copy provenance does not use module-relative source %q:\n%s", want, provenance)
+		}
+	}
+	if strings.Contains(provenance, "upstream package: staging/src/") {
+		t.Errorf("copy provenance uses a Kubernetes-root source path:\n%s", provenance)
+	}
+
+	// 7. The retained validation/rule.go provenance records the staging import
+	// rewrite alongside the original extraction changes. The import of
+	// component-helpers/text/policy was rewritten to the relocated copy, and
+	// the provenance must say so.
+	retainedPkgDir := "internal/kk/pkg/registry/rbac/validation"
+	retainedProvFile := retainedPkgDir + "/SOAPBOX_PROVENANCE.txt"
+	retainedProvenance := fileContents(t, result, retainedProvFile)
+	// The provenance should contain the staging module path as part of the
+	// recorded import rewrite change.
+	if !strings.Contains(retainedProvenance, stagingComponentHelpers) {
+		t.Errorf("retained package provenance does not record the staging import rewrite for %s:\n%s",
+			stagingComponentHelpers, retainedProvenance)
+	}
+
+	// 8. The copied module's LICENSE file appears in the generated tree at the
+	// correct relocated path beside the copied package.
+	copiedLicensePath := "internal/kk/staging/src/" + stagingComponentHelpers + "/LICENSE"
+	if !slices.Contains(got, copiedLicensePath) {
+		t.Errorf("generated tree does not contain the copied module's LICENSE at %s, got:\n  %s",
+			copiedLicensePath, joinLines(got))
+	} else if copiedLicense := fileContents(t, result, copiedLicensePath); copiedLicense != fixtureLicense {
+		t.Errorf("copied module LICENSE differs from the verified source text:\n%s", copiedLicense)
+	}
+
+	// 9. The NOTICE records the copied package with its Origin URL, version,
+	// import path, and licence.
+	notice := fileContents(t, result, "NOTICE")
+	if !strings.Contains(notice, "Copied dependency packages") {
+		t.Error("NOTICE does not contain the copied dependency section")
+	}
+	if !strings.Contains(notice, stagingComponentHelpers+"/text/policy") {
+		t.Errorf("NOTICE does not name the copied package %s/text/policy:\n%s",
+			stagingComponentHelpers, notice)
+	}
+	if !strings.Contains(notice, expectedOriginURL) {
+		t.Errorf("NOTICE does not contain Origin URL %s:\n%s", expectedOriginURL, notice)
+	}
+	if !strings.Contains(notice, stagingComponentHelpers+"@"+fixtureStagingTag) {
+		t.Errorf("NOTICE does not contain module@version %s@%s:\n%s",
+			stagingComponentHelpers, fixtureStagingTag, notice)
+	}
+	if !strings.Contains(notice, stagingCommits[stagingComponentHelpers]) {
+		t.Errorf("NOTICE does not contain staging commit %s:\n%s",
+			stagingCommits[stagingComponentHelpers], notice)
+	}
+}
+
+// TestGenerateCopyThenForbidRemovesModule proves that a copy-approved profile
+// that copies a package from a staging module and then lists that module as
+// forbidden succeeds: the copy replaces the external dependency, the forbidden
+// module check runs after the copy, and the module is absent from go.mod,
+// go.sum, go list -m all, and all import paths in the generated tree.
+func TestGenerateCopyThenForbidRemovesModule(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+		cfg.Dependencies.Policy = config.DependencyPolicyCopyApproved
+		cfg.Dependencies.CopyPackages = []string{
+			"staging/src/" + stagingComponentHelpers + "/text/policy",
+		}
+		cfg.Dependencies.ForbiddenModules = []string{stagingComponentHelpers}
+		cfg.Dependencies.Gates.Cost.MaxCopiedPackages = 1
+		cfg.Dependencies.Gates.Cost.MaxCopiedLines = 500
+		cfg.Dependencies.Gates.Cost.MaxGeneratedFiles = 1
+		cfg.Dependencies.Gates.Cost.MaxDistinctLicenses = 1
+		cfg.Dependencies.Gates.Cost.MaxModuleZipBytes = 1 << 20
+		cfg.Dependencies.Gates.Cost.MaxReleasesPerMinor = 10
+		cfg.Dependencies.Gates.Cost.MinModulesRemoved = 1
+		cfg.Dependencies.Gates.Cost.MinPackagesRemoved = 1
+		cfg.Dependencies.Gates.Cost.MinLinesRemoved = 1
+		cfg.Dependencies.Overrides = []config.DependencyOverride{{
+			Package:       "staging/src/" + stagingComponentHelpers + "/text/policy",
+			Gate:          "minimumLeverage",
+			Justification: "file proxy does not populate go/packages Syntax for deps, so linesRemoved is zero",
+			Approver:      "test",
+			ExpiresAfter:  "v1.99",
+		}}
+	})
+
+	result := e.generateOnce(ctx, t)
+
+	if result.Report.Failure != nil {
+		t.Fatalf("generate: refused at %s: %s", result.Report.Failure.Stage, result.Report.Failure.Message)
+	}
+
+	// The copied file appears.
+	copiedPath := "internal/kk/staging/src/" + stagingComponentHelpers + "/text/policy/matcher.go"
+	got := treePaths(result)
+	if !slices.Contains(got, copiedPath) {
+		t.Errorf("generated tree does not contain copied file %s", copiedPath)
+	}
+
+	// The forbidden module is absent from go.mod.
+	goMod := fileContents(t, result, "go.mod")
+	if strings.Contains(goMod, stagingComponentHelpers) {
+		t.Errorf("go.mod still requires forbidden module %s:\n%s", stagingComponentHelpers, goMod)
+	}
+	if got, want := result.Report.Module.GoModHash, fmt.Sprintf("%x", sha256.Sum256([]byte(goMod))); got != want {
+		t.Errorf("reported go.mod hash = %s, want final hash %s", got, want)
+	}
+	for _, requirement := range result.Report.Module.Kept {
+		if requirement.Path == stagingComponentHelpers {
+			t.Errorf("module report still keeps forbidden module: %#v", requirement)
+		}
+	}
+	if !slices.Contains(result.Report.Module.Dropped, stagingComponentHelpers) {
+		t.Errorf("module report dropped = %v, want %s", result.Report.Module.Dropped, stagingComponentHelpers)
+	}
+
+	// The forbidden module is absent from go.sum.
+	if slices.Contains(got, "go.sum") {
+		goSum := fileContents(t, result, "go.sum")
+		if strings.Contains(goSum, stagingComponentHelpers) {
+			t.Errorf("go.sum contains forbidden module %s:\n%s", stagingComponentHelpers, goSum)
+		}
+	}
+
+	// No Go file imports a package belonging to the forbidden module.
+	for _, path := range got {
+		if !strings.HasSuffix(path, ".go") {
+			continue
+		}
+		contents := fileContents(t, result, path)
+		if strings.Contains(contents, `"`+stagingComponentHelpers+"/") || strings.Contains(contents, `"`+stagingComponentHelpers+`"`) {
+			t.Errorf("file %s still imports the forbidden module %s:\n%s", path, stagingComponentHelpers, contents)
+		}
+	}
+}
+
+func TestGenerateDualApiserverCompatibilityModes(t *testing.T) {
+	ctx := t.Context()
+
+	t.Run("external preserves apiserver identity", func(t *testing.T) {
+		e := newEndToEnd(ctx, t, nil)
+		result := e.generateOnce(ctx, t)
+		goMod := fileContents(t, result, "go.mod")
+		if !strings.Contains(goMod, stagingAPIServer+" "+fixtureStagingTag) {
+			t.Errorf("external go.mod does not require %s:\n%s", stagingAPIServer, goMod)
+		}
+		assertions := fileContents(t, result, "zz_generated_assertions.go")
+		if !strings.Contains(assertions, stagingAPIServer+"/pkg/authorization/authorizer") {
+			t.Errorf("external assertions do not use real apiserver identity:\n%s", assertions)
+		}
+	})
+
+	t.Run("local removes apiserver and exports local types", func(t *testing.T) {
+		e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+			cfg.Compatibility.Apiserver = config.CompatibilityApiserverLocal
+			cfg.Dependencies.ForbiddenModules = append(cfg.Dependencies.ForbiddenModules, stagingAPIServer)
+		})
+		result := e.generateOnce(ctx, t)
+		goMod := fileContents(t, result, "go.mod")
+		if strings.Contains(goMod, stagingAPIServer) {
+			t.Errorf("local go.mod retains apiserver:\n%s", goMod)
+		}
+		for _, file := range result.Files.Files {
+			if strings.HasSuffix(file.Path, ".go") && strings.Contains(string(file.Contents), `"`+stagingAPIServer+`/`) {
+				t.Errorf("local file %s imports apiserver:\n%s", file.Path, file.Contents)
+			}
+		}
+		facade := fileContents(t, result, "authorizer.go")
+		for _, name := range []string{
+			"UserInfo", "DefaultUserInfo", "Attributes", "AttributesRecord",
+			"Decision", "DecisionDeny", "DecisionAllow", "DecisionNoOpinion",
+			"Authorizer", "RuleResolver", "ResourceRuleInfo",
+			"DefaultResourceRuleInfo", "NonResourceRuleInfo", "DefaultNonResourceRuleInfo",
+		} {
+			if !strings.Contains(facade, name) {
+				t.Errorf("local facade does not expose %s:\n%s", name, facade)
+			}
+		}
+		assertions := fileContents(t, result, "zz_generated_assertions.go")
+		if strings.Contains(assertions, stagingAPIServer) {
+			t.Errorf("local assertions retain external apiserver:\n%s", assertions)
+		}
+		validation := fileContents(t, result, "internal/kk/pkg/registry/rbac/validation/rule.go")
+		if strings.Contains(validation, "/pkg/endpoints/request") || strings.Contains(validation, "UserFrom(ctx)") || strings.Contains(validation, "NamespaceFrom(ctx)") {
+			t.Errorf("local validation retains private request context identity:\n%s", validation)
+		}
+		notice := fileContents(t, result, "NOTICE")
+		if !strings.Contains(notice, "not assignable to k8s.io/apiserver types") || !strings.Contains(notice, "explicit user and namespace") {
+			t.Errorf("local NOTICE does not disclose compatibility break:\n%s", notice)
+		}
+	})
 }
 
 // TestGenerateProducesCompleteModule is the end-to-end proof.
@@ -398,6 +817,758 @@ func TestGeneratePinsStagingAndTidiesModule(t *testing.T) {
 	if sum := fileContents(t, result, "go.sum"); !strings.Contains(sum, stagingAPI) {
 		t.Errorf("generated go.sum does not cover %s:\n%s", stagingAPI, sum)
 	}
+}
+
+func TestGenerateExactCommitUsesAnIntermediateVersionIndexEntry(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, nil)
+	e.opts.Materialize = false
+	tagged := e.generateOnce(ctx, t)
+
+	store, err := gomodmap.NewStore(e.roots.store)
+	if err != nil {
+		t.Fatalf("open version index: %v", err)
+	}
+	index, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load version index: %v", err)
+	}
+	entry, ok := index.Lookup(e.upstream.commit)
+	if !ok {
+		t.Fatalf("version index has no release entry for %s", e.upstream.commit)
+	}
+	intermediate := gomodmap.NewIndex()
+	if err := intermediate.Put(gomodmap.Entry{Source: entry.Source, Modules: entry.Modules}); err != nil {
+		t.Fatalf("build intermediate entry: %v", err)
+	}
+	intermediatePath := e.roots.store + ".intermediate"
+	intermediateStore, err := gomodmap.NewStore(intermediatePath)
+	if err != nil {
+		t.Fatalf("open intermediate version index: %v", err)
+	}
+	if err := intermediateStore.Save(ctx, intermediate); err != nil {
+		t.Fatalf("save intermediate entry: %v", err)
+	}
+
+	e.opts.StorePath = intermediatePath
+	e.opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: e.upstream.commit}
+	e.opts.ReleaseContext = fixtureTag
+	e.opts.HistoryAnchor = e.upstream.commit
+	e.opts.HistoryAnchorRelease = fixtureTag
+	e.opts.Fetch = false
+	exact := e.generateOnce(ctx, t)
+	if exact.Report.Source.RefKind != string(extract.RefCommit) || exact.Report.Source.RefName != e.upstream.commit {
+		t.Errorf("exact source = %s %s, want commit %s", exact.Report.Source.RefKind, exact.Report.Source.RefName, e.upstream.commit)
+	}
+	if exact.Report.Source.ReleaseTag != "" {
+		t.Errorf("exact commit release tag = %q, want empty", exact.Report.Source.ReleaseTag)
+	}
+	if !exact.Report.Staging.Cached {
+		t.Error("exact commit did not reuse its intermediate staging entry")
+	}
+	if exact.Report.Output.ManifestHash == tagged.Report.Output.ManifestHash {
+		t.Error("exact commit and release-tag provenance unexpectedly produced one manifest")
+	}
+}
+
+func TestGenerateExactCommitResolvesIntermediateStagingHistory(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+		cfg.Dependencies.Policy = config.DependencyPolicyExternal
+		cfg.Dependencies.CopyPackages = nil
+		cfg.Dependencies.ForbiddenModules = nil
+		cfg.Dependencies.Overrides = nil
+	})
+	e.opts.Materialize = false
+	// Fetch the source release first. Exact-commit generation itself refuses to
+	// fetch by object name and consumes this bounded cache.
+	e.generateOnce(ctx, t)
+
+	e.opts.StorePath = e.roots.store + ".cold-intermediate"
+	e.opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: e.upstream.commit}
+	e.opts.ReleaseContext = fixtureTag
+	e.opts.HistoryAnchor = e.upstream.commit
+	e.opts.HistoryAnchorRelease = fixtureTag
+	e.opts.StagingSources = addIntermediateStagingFixtures(ctx, t, e)
+	e.opts.Fetch = false
+	result := e.generateOnce(ctx, t)
+
+	if result.Report.Staging.Cached {
+		t.Error("cold intermediate resolution was reported as cached")
+	}
+	if len(result.Report.Staging.Modules) != len(e.opts.StagingSources) {
+		t.Fatalf("resolved %d staging modules, want %d", len(result.Report.Staging.Modules), len(e.opts.StagingSources))
+	}
+	for _, pinned := range result.Report.Staging.Modules {
+		if !strings.Contains(pinned.Version, "-20260102030405-") {
+			t.Errorf("staging module %s version = %q, want a Go-resolved pseudo-version", pinned.Path, pinned.Version)
+		}
+		if pinned.Commit == "" {
+			t.Errorf("staging module %s records no mapped commit", pinned.Path)
+		}
+	}
+
+	store, err := gomodmap.NewStore(e.opts.StorePath)
+	if err != nil {
+		t.Fatalf("open intermediate index: %v", err)
+	}
+	index, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load intermediate index: %v", err)
+	}
+	entry, ok := index.Lookup(e.upstream.commit)
+	if !ok {
+		t.Fatalf("intermediate index has no entry for %s", e.upstream.commit)
+	}
+	if entry.Tag != "" {
+		t.Errorf("intermediate entry tag = %q, want empty", entry.Tag)
+	}
+	if len(entry.Modules) != len(result.Report.Staging.Modules) {
+		t.Errorf("intermediate index records %d modules, report has %d", len(entry.Modules), len(result.Report.Staging.Modules))
+	}
+}
+
+func TestGenerateExactCommitCopiesFromPseudoVersionEvidence(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+		cfg.Dependencies.Policy = config.DependencyPolicyCopyApproved
+		cfg.Dependencies.CopyPackages = []string{
+			"staging/src/" + stagingComponentHelpers + "/text/policy",
+		}
+		cfg.Dependencies.ForbiddenModules = []string{stagingComponentHelpers}
+		cfg.Dependencies.Gates.Cost.MaxCopiedPackages = 1
+		cfg.Dependencies.Gates.Cost.MaxCopiedLines = 500
+		cfg.Dependencies.Gates.Cost.MaxGeneratedFiles = 1
+		cfg.Dependencies.Gates.Cost.MaxDistinctLicenses = 1
+		cfg.Dependencies.Gates.Cost.MaxModuleZipBytes = 1 << 20
+		cfg.Dependencies.Gates.Cost.MaxReleasesPerMinor = 10
+		cfg.Dependencies.Gates.Cost.MinModulesRemoved = 1
+		cfg.Dependencies.Gates.Cost.MinPackagesRemoved = 1
+		cfg.Dependencies.Gates.Cost.MinLinesRemoved = 1
+		cfg.Dependencies.Overrides = []config.DependencyOverride{{
+			Package:       "staging/src/" + stagingComponentHelpers + "/text/policy",
+			Gate:          "minimumLeverage",
+			Justification: "file proxy does not populate go/packages Syntax for deps, so linesRemoved is zero",
+			Approver:      "test",
+			ExpiresAfter:  "v1.99",
+		}}
+	})
+	e.opts.Materialize = false
+	e.generateOnce(ctx, t)
+
+	e.opts.StorePath = e.roots.store + ".cold-pseudo-copy"
+	e.opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: e.upstream.commit}
+	e.opts.ReleaseContext = fixtureTag
+	e.opts.HistoryAnchor = e.upstream.commit
+	e.opts.HistoryAnchorRelease = fixtureTag
+	e.opts.StagingSources = addIntermediateStagingFixtures(ctx, t, e)
+	e.opts.Fetch = false
+	result := e.generateOnce(ctx, t)
+
+	var componentVersion, componentCommit string
+	for _, pinned := range result.Report.Staging.Modules {
+		if pinned.Path == stagingComponentHelpers {
+			componentVersion = pinned.Version
+			componentCommit = pinned.Commit
+		}
+	}
+	if !strings.Contains(componentVersion, "-20260102030405-") {
+		t.Fatalf("component-helpers version = %q, want pseudo-version", componentVersion)
+	}
+	copiedPath := "internal/kk/staging/src/" + stagingComponentHelpers + "/text/policy/matcher.go"
+	if !slices.Contains(treePaths(result), copiedPath) {
+		t.Fatalf("generated tree does not contain pseudo-version copy %s", copiedPath)
+	}
+	notice := fileContents(t, result, "NOTICE")
+	for _, want := range []string{
+		stagingComponentHelpers + "@" + componentVersion,
+		"upstream commit: " + componentCommit,
+	} {
+		if !strings.Contains(notice, want) {
+			t.Errorf("NOTICE does not contain %q:\n%s", want, notice)
+		}
+	}
+}
+
+func TestReplayDAGProjectsInitialReleaseWithRealGeneration(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, nil)
+	e.opts.Materialize = false
+
+	cache, err := source.Open(ctx, source.Options{
+		Remote: e.upstream.url(), CacheRoot: e.roots.cache,
+		WorktreeRoot: filepath.Join(e.roots.work, "dag-source-worktrees"),
+		Git:          e.opts.Git,
+	})
+	if err != nil {
+		t.Fatalf("open source cache: %v", err)
+	}
+	if err := cache.Fetch(ctx, source.Refs{Tags: []string{fixtureTag}}); err != nil {
+		t.Fatalf("fetch source release: %v", err)
+	}
+	resolved, err := cache.Resolve(ctx, source.Refs{Tags: []string{fixtureTag}})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("resolve source release = %#v, %v", resolved, err)
+	}
+
+	destination := testsupport.NewRepo(ctx, t, testsupport.Options{
+		Branch: "main", UserName: "Soapbox DAG Test", UserEmail: "dag@example.com",
+	})
+	for path, contents := range map[string]string{
+		".github/workflows/ci.yml":   "name: ci\n",
+		".github/workflows/sync.yml": "name: sync\n",
+		"go.mod":                     "module example.com/control\n",
+		"soapbox.yaml":               "version: 2\n",
+		"tools/cmd/soapbox/main.go":  "package main\n",
+		"tools/go.mod":               "module example.com/control/tools\n",
+	} {
+		destination.WriteFile(t, path, contents)
+	}
+	parent := destination.Commit(ctx, t, "setup control plane\n", gitcli.CommitOptions{},
+		".github/workflows/ci.yml", ".github/workflows/sync.yml", "go.mod", "soapbox.yaml",
+		"tools/cmd/soapbox/main.go", "tools/go.mod")
+
+	result, err := enginesync.ReplayDAG(ctx, enginesync.DAGOptions{
+		Config: e.opts.Config, SourceCache: cache, DestinationGit: destination.Git,
+		Generate: e.opts, AnchorCommit: e.upstream.commit, EpochParent: parent,
+		Release: source.Release{Source: resolved[0], DestinationTag: fixtureStagingTag},
+	})
+	if err != nil {
+		t.Fatalf("replay DAG: %v", err)
+	}
+	if result.ReleaseGeneration == nil || result.ReleaseGeneration.Report.Source.Commit != e.upstream.commit {
+		t.Fatalf("release generation = %#v, want source %s", result.ReleaseGeneration, e.upstream.commit)
+	}
+	if result.GeneratedCommits != 1 || result.PrefilteredCommits != 0 {
+		t.Errorf("generated %d, prefiltered %d, want 1 and 0", result.GeneratedCommits, result.PrefilteredCommits)
+	}
+	if result.Replay == nil || len(result.Replay.Heads) != 1 || result.Replay.Heads[0].Destination == "" {
+		t.Fatalf("replay result = %#v, want one destination head", result.Replay)
+	}
+}
+
+func TestReplayDAGContinuesPublishedReleaseAndPrefiltersDocs(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, nil)
+	e.opts.Materialize = false
+
+	e.upstream.repo.WriteFile(t, "docs/next.md", "not part of the generated closure\n")
+	docs := e.upstream.repo.Commit(ctx, t, "docs: prepare next release\n", gitcli.CommitOptions{}, "docs/next.md")
+	const rbacPath = "plugin/pkg/auth/authorizer/rbac/rbac.go"
+	e.upstream.repo.WriteFile(t, rbacPath, upstreamRBAC+"\n// NextRelease keeps the fixture tree observably new.\n")
+	next := e.upstream.repo.Commit(ctx, t, "feat: update the rbac authorizer\n", gitcli.CommitOptions{}, rbacPath)
+	const nextSourceTag = "v1.36.2"
+	const nextModuleTag = "v0.36.2"
+	if err := e.upstream.repo.Git.CreateTag(ctx, gitcli.TagOptions{
+		Name: nextSourceTag, Commit: next, Message: "Kubernetes " + nextSourceTag + "\n",
+		Tagger: gitcli.Signature{Name: "Fixture Author", Email: "fixture@example.test", Date: "2026-02-02T03:04:05Z"},
+	}); err != nil {
+		t.Fatalf("tag next source release: %v", err)
+	}
+	for modulePath, files := range proxyModules {
+		writeProxyModule(t, e.proxy, modulePath, nextModuleTag, stagingCommits[modulePath], files)
+	}
+
+	cache, err := source.Open(ctx, source.Options{
+		Remote: e.upstream.url(), CacheRoot: e.roots.cache,
+		WorktreeRoot: filepath.Join(e.roots.work, "continuation-source-worktrees"),
+		Git:          e.opts.Git,
+	})
+	if err != nil {
+		t.Fatalf("open source cache: %v", err)
+	}
+	if err := cache.Fetch(ctx, source.Refs{Tags: []string{fixtureTag, nextSourceTag}}); err != nil {
+		t.Fatalf("fetch source releases: %v", err)
+	}
+	resolved, err := cache.Resolve(ctx, source.Refs{Tags: []string{fixtureTag, nextSourceTag}})
+	if err != nil || len(resolved) != 2 {
+		t.Fatalf("resolve source releases = %#v, %v", resolved, err)
+	}
+	byName := map[string]source.Revision{}
+	for _, revision := range resolved {
+		byName[revision.Name] = revision
+	}
+
+	destination := testsupport.NewRepo(ctx, t, testsupport.Options{
+		Branch: "main", UserName: "Soapbox DAG Test", UserEmail: "dag@example.com",
+	})
+	for path, contents := range map[string]string{
+		".github/workflows/ci.yml":   "name: ci\n",
+		".github/workflows/sync.yml": "name: sync\n",
+		"go.mod":                     "module example.com/control\n",
+		"soapbox.yaml":               "version: 2\n",
+		"tools/cmd/soapbox/main.go":  "package main\n",
+		"tools/go.mod":               "module example.com/control/tools\n",
+	} {
+		destination.WriteFile(t, path, contents)
+	}
+	setupParent := destination.Commit(ctx, t, "setup control plane\n", gitcli.CommitOptions{},
+		".github/workflows/ci.yml", ".github/workflows/sync.yml", "go.mod", "soapbox.yaml",
+		"tools/cmd/soapbox/main.go", "tools/go.mod")
+
+	first, err := enginesync.ReplayDAG(ctx, enginesync.DAGOptions{
+		Config: e.opts.Config, SourceCache: cache, DestinationGit: destination.Git,
+		Generate: e.opts, AnchorCommit: e.upstream.commit, EpochParent: setupParent,
+		Release: source.Release{Source: byName[fixtureTag], DestinationTag: fixtureStagingTag},
+	})
+	if err != nil {
+		t.Fatalf("project first release: %v", err)
+	}
+	firstHead := first.Replay.Heads[0].Destination
+
+	second, err := enginesync.ReplayDAG(ctx, enginesync.DAGOptions{
+		Config: e.opts.Config, SourceCache: cache, DestinationGit: destination.Git,
+		Generate: e.opts, AnchorCommit: e.upstream.commit, AnchorTag: fixtureTag,
+		MappedAnchor: true, EpochParent: firstHead,
+		Release: source.Release{Source: byName[nextSourceTag], DestinationTag: nextModuleTag},
+	})
+	if err != nil {
+		t.Fatalf("project next release: %v", err)
+	}
+	if second.GeneratedCommits != 1 || second.PrefilteredCommits != 2 {
+		t.Errorf("generated %d, prefiltered %d, want 1 and 2", second.GeneratedCommits, second.PrefilteredCommits)
+	}
+	records := map[string]replay.Record{}
+	for _, record := range second.Replay.Records {
+		records[record.Source] = record
+	}
+	if !records[e.upstream.commit].Collapsed || !records[docs].Collapsed {
+		t.Errorf("published anchor/docs did not collapse: %#v %#v", records[e.upstream.commit], records[docs])
+	}
+	if records[next].Destination == "" || records[next].Collapsed {
+		t.Fatalf("next release record = %#v, want a written destination commit", records[next])
+	}
+	if second.ReleaseGeneration.Report.Source.RefName != nextSourceTag || second.ReleaseGeneration.Report.Source.ReleaseTag != nextModuleTag {
+		t.Errorf("release generation = source %q destination %q, want %q and %q",
+			second.ReleaseGeneration.Report.Source.RefName, second.ReleaseGeneration.Report.Source.ReleaseTag,
+			nextSourceTag, nextModuleTag)
+	}
+}
+
+func TestPlanChunkCheckpointsResumesAndGraftsEpoch(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+		cfg.Determinism.ChunkSize = 1
+	})
+	e.opts.Materialize = false
+
+	e.upstream.repo.WriteFile(t, "docs/chunk-one.md", "irrelevant first chunk input\n")
+	docs := e.upstream.repo.Commit(ctx, t, "docs: add chunk note\n", gitcli.CommitOptions{}, "docs/chunk-one.md")
+	const rbacPath = "plugin/pkg/auth/authorizer/rbac/rbac.go"
+	e.upstream.repo.WriteFile(t, rbacPath, upstreamRBAC+"\n// ChunkRelevant changes watched source.\n")
+	relevant := e.upstream.repo.Commit(ctx, t, "feat: change watched rbac source\n", gitcli.CommitOptions{}, rbacPath)
+	e.upstream.repo.WriteFile(t, "docs/chunk-two.md", "release boundary\n")
+	final := e.upstream.repo.Commit(ctx, t, "docs: cut next release\n", gitcli.CommitOptions{}, "docs/chunk-two.md")
+	const nextSourceTag = "v1.36.2"
+	const nextModuleTag = "v0.36.2"
+	if err := e.upstream.repo.Git.CreateTag(ctx, gitcli.TagOptions{
+		Name: nextSourceTag, Commit: final, Message: "Kubernetes " + nextSourceTag + "\n",
+		Tagger: gitcli.Signature{Name: "Fixture Author", Email: "fixture@example.test", Date: "2026-02-02T03:04:05Z"},
+	}); err != nil {
+		t.Fatalf("tag next source release: %v", err)
+	}
+	for modulePath, files := range proxyModules {
+		writeProxyModule(t, e.proxy, modulePath, nextModuleTag, stagingCommits[modulePath], files)
+	}
+
+	cache, err := source.Open(ctx, source.Options{
+		Remote: e.upstream.url(), CacheRoot: e.roots.cache,
+		WorktreeRoot: filepath.Join(e.roots.work, "chunk-source-worktrees"),
+		Git:          e.opts.Git,
+	})
+	if err != nil {
+		t.Fatalf("open source cache: %v", err)
+	}
+	if err := cache.Fetch(ctx, source.Refs{Tags: []string{fixtureTag, nextSourceTag}}); err != nil {
+		t.Fatalf("fetch source releases: %v", err)
+	}
+	resolved, err := cache.Resolve(ctx, source.Refs{Tags: []string{fixtureTag, nextSourceTag}})
+	if err != nil || len(resolved) != 2 {
+		t.Fatalf("resolve source releases = %#v, %v", resolved, err)
+	}
+	byName := map[string]source.Revision{}
+	for _, revision := range resolved {
+		byName[revision.Name] = revision
+	}
+
+	destination := testsupport.NewRepo(ctx, t, testsupport.Options{
+		Branch: "main", UserName: "Soapbox Chunk Test", UserEmail: "chunk@example.com",
+	})
+	for path, contents := range map[string]string{
+		".github/workflows/ci.yml":   "name: ci\n",
+		".github/workflows/sync.yml": "name: sync\n",
+		"go.mod":                     "module example.com/control\n",
+		"soapbox.yaml":               "version: 2\n",
+		"tools/cmd/soapbox/main.go":  "package main\n",
+		"tools/go.mod":               "module example.com/control/tools\n",
+	} {
+		destination.WriteFile(t, path, contents)
+	}
+	setupParent := destination.Commit(ctx, t, "setup control plane\n", gitcli.CommitOptions{},
+		".github/workflows/ci.yml", ".github/workflows/sync.yml", "go.mod", "soapbox.yaml",
+		"tools/cmd/soapbox/main.go", "tools/go.mod")
+	first, err := enginesync.ReplayDAG(ctx, enginesync.DAGOptions{
+		Config: e.opts.Config, SourceCache: cache, DestinationGit: destination.Git,
+		Generate: e.opts, AnchorCommit: e.upstream.commit, EpochParent: setupParent,
+		Release: source.Release{Source: byName[fixtureTag], DestinationTag: fixtureStagingTag},
+	})
+	if err != nil {
+		t.Fatalf("project initial release: %v", err)
+	}
+	consumerHead := first.Replay.Heads[0].Destination
+	consumerTree, err := destination.Git.ResolveTree(ctx, consumerHead)
+	if err != nil {
+		t.Fatalf("resolve initial consumer tree: %v", err)
+	}
+	initialTagInfo, err := cache.Git().TagInfo(ctx, fixtureTag)
+	if err != nil {
+		t.Fatalf("read initial source tag: %v", err)
+	}
+	initialRelease, err := enginerelease.Project(ctx, destination.Git, enginerelease.Options{
+		Policy: e.opts.Config.Release.Policy,
+		Source: enginerelease.Source{
+			Tag: fixtureTag, Commit: e.upstream.commit, Tagger: initialTagInfo.Tagger,
+			URL: "https://github.com/kubernetes/kubernetes/releases/tag/" + fixtureTag,
+		},
+		Replay:     enginerelease.Replay{Commit: consumerHead, Tree: consumerTree},
+		Projection: consumerTree,
+		Bot: enginerelease.Identity{
+			Name: e.opts.Config.Commit.Committer.Name, Email: e.opts.Config.Commit.Committer.Email,
+		},
+	})
+	if err != nil {
+		t.Fatalf("project initial release tag: %v", err)
+	}
+	if err := destination.Git.UpdateRef(ctx, "refs/heads/main", consumerHead, setupParent); err != nil {
+		t.Fatalf("advance local consumer branch: %v", err)
+	}
+
+	format, err := destination.Git.ObjectFormat(ctx)
+	if err != nil {
+		t.Fatalf("destination object format: %v", err)
+	}
+	prior, err := state.New(state.Document{
+		Schema: state.Schema, ObjectFormat: format,
+		Destination: state.Destination{
+			Repository: e.opts.Config.Destination.Repository,
+			Module:     e.opts.Config.Destination.Module,
+		},
+		Anchor: state.Anchor{Source: e.upstream.commit, Ref: "refs/tags/" + fixtureTag},
+		Epoch: state.Epoch{
+			Profile: "sha256:" + strings.Repeat("a", 64),
+			Source:  e.upstream.commit, Destination: setupParent,
+		},
+		Cursors: []state.Cursor{{Ref: "refs/tags/" + fixtureTag, Source: e.upstream.commit, Destination: consumerHead}},
+		Published: []state.Published{
+			{Ref: "refs/heads/main", Kind: state.KindBranch, Source: e.upstream.commit, Object: consumerHead},
+			{Ref: "refs/tags/" + fixtureStagingTag, Kind: state.KindTag, Source: e.upstream.commit, Object: initialRelease.Object},
+		},
+		Engine: state.Engine{Version: "old-engine", Toolchain: e.opts.Config.Determinism.Toolchain},
+	})
+	if err != nil {
+		t.Fatalf("build prior state: %v", err)
+	}
+	stateSignature := gitcli.Signature{
+		Name: e.opts.Config.Commit.Committer.Name, Email: e.opts.Config.Commit.Committer.Email,
+		Date: "1700000000 +0000",
+	}
+	priorRecord, err := state.Store(ctx, destination.Git, state.StoreOptions{
+		Document: prior, Author: stateSignature, Committer: stateSignature,
+	})
+	if err != nil {
+		t.Fatalf("store prior state: %v", err)
+	}
+	if err := destination.Git.CreateRef(ctx, e.opts.Config.Destination.StateRef, priorRecord.Commit); err != nil {
+		t.Fatalf("create local state ref: %v", err)
+	}
+
+	remote := testsupport.NewRepo(ctx, t, testsupport.Options{
+		Branch: "main", UserName: "Soapbox Remote", UserEmail: "remote@example.com",
+	})
+	if err := remote.Git.SetConfigLocal(ctx, "core.bare", "true"); err != nil {
+		t.Fatalf("make remote bare: %v", err)
+	}
+	remotePath := filepath.Join(remote.Dir, ".git")
+	if err := destination.Git.PushAtomic(ctx, remotePath, []gitcli.PushUpdate{
+		{Ref: "refs/heads/main", New: consumerHead, ExpectAbsent: true},
+		{Ref: "refs/tags/" + fixtureStagingTag, New: initialRelease.Object, ExpectAbsent: true},
+		{Ref: e.opts.Config.Destination.StateRef, New: priorRecord.Commit, ExpectAbsent: true},
+	}); err != nil {
+		t.Fatalf("seed destination remote: %v", err)
+	}
+
+	e.opts.StagingSources = addIntermediateStagingFixtures(ctx, t, e, nextModuleTag)
+	e.opts.Config.Source.Refs.AnchorCommit = e.upstream.commit
+	release := source.Release{Source: byName[nextSourceTag], DestinationTag: nextModuleTag}
+
+	autoRemote := testsupport.NewRepo(ctx, t, testsupport.Options{
+		Branch: "main", UserName: "Soapbox Automatic Remote", UserEmail: "automatic@example.com",
+	})
+	if err := autoRemote.Git.SetConfigLocal(ctx, "core.bare", "true"); err != nil {
+		t.Fatalf("make automatic remote bare: %v", err)
+	}
+	autoRemotePath := filepath.Join(autoRemote.Dir, ".git")
+	if err := destination.Git.PushAtomic(ctx, autoRemotePath, []gitcli.PushUpdate{
+		{Ref: "refs/heads/main", New: consumerHead, ExpectAbsent: true},
+		{Ref: "refs/tags/" + fixtureStagingTag, New: initialRelease.Object, ExpectAbsent: true},
+		{Ref: e.opts.Config.Destination.StateRef, New: priorRecord.Commit, ExpectAbsent: true},
+	}); err != nil {
+		t.Fatalf("seed automatic remote: %v", err)
+	}
+	automaticDestination := enginesync.Destination{
+		Git: destination.Git, Remote: autoRemotePath,
+		Identity:         "github.com/" + e.opts.Config.Destination.Repository,
+		AllowLocalRemote: true,
+	}
+	automatic, err := enginesync.Reconcile(ctx, enginesync.ReconcileOptions{
+		Config: e.opts.Config, SourceCache: cache,
+		LocalGit:    destination.Git.Anonymous().WithNoLazyFetch(),
+		Destination: automaticDestination, Generate: e.opts, Automatic: true,
+	})
+	if err != nil {
+		t.Fatalf("automatic reconciliation: %v", err)
+	}
+	if !automatic.FixedPoint || len(automatic.Actions) < 2 || automatic.Actions[len(automatic.Actions)-1].Kind != "release" {
+		t.Fatalf("automatic reconciliation = %#v, want checkpoints then a release fixed point", automatic)
+	}
+	for _, action := range automatic.Actions {
+		if !action.Applied {
+			t.Errorf("automatic action was not applied: %#v", action)
+		}
+	}
+	autoRefs := remoteRefMap(ctx, t, destination.Git, autoRemotePath, format.HexLength())
+	if autoRefs["refs/heads/main"] == consumerHead || autoRefs["refs/tags/"+nextModuleTag] == "" {
+		t.Errorf("automatic consumer refs = %#v, want advanced branch and new tag", autoRefs)
+	}
+
+	planRemote := testsupport.NewRepo(ctx, t, testsupport.Options{
+		Branch: "main", UserName: "Soapbox Plan Remote", UserEmail: "plan@example.com",
+	})
+	if err := planRemote.Git.SetConfigLocal(ctx, "core.bare", "true"); err != nil {
+		t.Fatalf("make plan remote bare: %v", err)
+	}
+	planRemotePath := filepath.Join(planRemote.Dir, ".git")
+	if err := destination.Git.PushAtomic(ctx, planRemotePath, []gitcli.PushUpdate{
+		{Ref: "refs/heads/main", New: consumerHead, ExpectAbsent: true},
+		{Ref: "refs/tags/" + fixtureStagingTag, New: initialRelease.Object, ExpectAbsent: true},
+		{Ref: e.opts.Config.Destination.StateRef, New: priorRecord.Commit, ExpectAbsent: true},
+	}); err != nil {
+		t.Fatalf("seed plan remote: %v", err)
+	}
+	planDestination := automaticDestination
+	planDestination.Remote = planRemotePath
+	planned, err := enginesync.Reconcile(ctx, enginesync.ReconcileOptions{
+		Config: e.opts.Config, SourceCache: cache,
+		LocalGit:    destination.Git.Anonymous().WithNoLazyFetch(),
+		Destination: planDestination, Generate: e.opts,
+	})
+	if err != nil {
+		t.Fatalf("plan-only reconciliation: %v", err)
+	}
+	if len(planned.Actions) != 1 || planned.Actions[0].Kind != "checkpoint" || planned.Actions[0].Applied {
+		t.Fatalf("plan-only reconciliation = %#v, want one unapplied checkpoint", planned)
+	}
+	planRefs := remoteRefMap(ctx, t, destination.Git, planRemotePath, format.HexLength())
+	if planRefs["refs/heads/main"] != consumerHead || planRefs[e.opts.Config.Destination.StateRef] != priorRecord.Commit || planRefs[state.ProgressNamespace+nextModuleTag] != "" {
+		t.Errorf("plan-only reconciliation moved remote refs: %#v", planRefs)
+	}
+	manuallyApplied, err := enginesync.Reconcile(ctx, enginesync.ReconcileOptions{
+		Config: e.opts.Config, SourceCache: cache,
+		LocalGit:    destination.Git.Anonymous().WithNoLazyFetch(),
+		Destination: planDestination, Generate: e.opts,
+		Apply: true, Approval: planned.Actions[0].PlanHash,
+	})
+	if err != nil {
+		t.Fatalf("manual approved reconciliation: %v", err)
+	}
+	if len(manuallyApplied.Actions) != 1 || !manuallyApplied.Actions[0].Applied {
+		t.Fatalf("manual approved reconciliation = %#v, want one applied checkpoint", manuallyApplied)
+	}
+	planRefs = remoteRefMap(ctx, t, destination.Git, planRemotePath, format.HexLength())
+	if planRefs["refs/heads/main"] != consumerHead || planRefs[e.opts.Config.Destination.StateRef] == priorRecord.Commit || planRefs[state.ProgressNamespace+nextModuleTag] == "" {
+		t.Errorf("manual approved checkpoint refs = %#v", planRefs)
+	}
+
+	destinationConfig := enginesync.Destination{
+		Git: destination.Git, Remote: remotePath,
+		Identity: "local/chunk-test", AllowLocalRemote: true,
+	}
+	discovery := &enginesync.Discovery{
+		Format: format,
+		Observed: map[string]string{
+			"refs/heads/main":                  consumerHead,
+			e.opts.Config.Destination.StateRef: priorRecord.Commit,
+		},
+		StateCommit: priorRecord.Commit, State: prior,
+		Pending: []enginesync.PendingRelease{{Source: release, DestinationTag: nextModuleTag}},
+	}
+	firstChunk, err := enginesync.PlanChunk(ctx, enginesync.ChunkOptions{
+		Config: e.opts.Config, Discovery: discovery, SourceCache: cache,
+		Destination: destinationConfig, Generate: e.opts, Release: release,
+	})
+	if err != nil {
+		t.Fatalf("plan first chunk: %v", err)
+	}
+	if firstChunk.Complete {
+		t.Fatal("first chunk unexpectedly completed the release")
+	}
+	if actions := firstChunk.Publish.Actions(publish.ScopeConsumer); len(actions) != 0 {
+		t.Fatalf("checkpoint plan contains consumer actions: %#v", actions)
+	}
+	if firstChunk.Track.Source != relevant || firstChunk.Track.Done != 2 || firstChunk.Track.Total != 3 {
+		t.Errorf("first track = %#v, want source %s at 2/3", firstChunk.Track, relevant)
+	}
+	if firstChunk.Document.Epoch.Source != docs || firstChunk.Document.Epoch.Destination != consumerHead {
+		t.Errorf("grafted epoch = %#v, want source %s on %s", firstChunk.Document.Epoch, docs, consumerHead)
+	}
+	if firstChunk.Document.Epoch.Profile == prior.Epoch.Profile {
+		t.Error("profile change did not start a new epoch")
+	}
+	repeated, err := enginesync.PlanChunk(ctx, enginesync.ChunkOptions{
+		Config: e.opts.Config, Discovery: discovery, SourceCache: cache,
+		Destination: destinationConfig, Generate: e.opts, Release: release,
+	})
+	if err != nil {
+		t.Fatalf("repeat first chunk plan: %v", err)
+	}
+	if repeated.State.Commit != firstChunk.State.Commit || repeated.Publish.Hash() != firstChunk.Publish.Hash() || repeated.Track != firstChunk.Track {
+		t.Fatalf("repeated chunk differs:\n first state=%s plan=%s track=%#v\n again state=%s plan=%s track=%#v",
+			firstChunk.State.Commit, firstChunk.Publish.Hash(), firstChunk.Track,
+			repeated.State.Commit, repeated.Publish.Hash(), repeated.Track)
+	}
+	applied, err := enginesync.ApplyCheckpoint(ctx, firstChunk, firstChunk.Publish.Hash(), false)
+	if err != nil {
+		t.Fatalf("apply first checkpoint: %v", err)
+	}
+	if !slices.Contains(applied.Pushed, firstChunk.Track.Ref) || !slices.Contains(applied.Pushed, e.opts.Config.Destination.StateRef) {
+		t.Errorf("first checkpoint pushed %v, want progress and state", applied.Pushed)
+	}
+
+	observed := remoteRefMap(ctx, t, destination.Git, remotePath, format.HexLength())
+	if observed["refs/heads/main"] != consumerHead {
+		t.Fatalf("consumer branch moved during checkpoint: %s, want %s", observed["refs/heads/main"], consumerHead)
+	}
+	secondDiscovery := &enginesync.Discovery{
+		Format: format, Observed: observed,
+		StateCommit: firstChunk.State.Commit, State: firstChunk.Document,
+		Pending: []enginesync.PendingRelease{{Source: release, DestinationTag: nextModuleTag}},
+	}
+	secondChunk, err := enginesync.PlanChunk(ctx, enginesync.ChunkOptions{
+		Config: e.opts.Config, Discovery: secondDiscovery, SourceCache: cache,
+		Destination: destinationConfig, Generate: e.opts, Release: release,
+	})
+	if err != nil {
+		t.Fatalf("plan resumed chunk: %v", err)
+	}
+	if !secondChunk.Complete || secondChunk.Track.Source != final || secondChunk.Track.Done != 3 {
+		t.Fatalf("resumed track = %#v complete=%v, want final source at 3/3", secondChunk.Track, secondChunk.Complete)
+	}
+	if secondChunk.Document.Mapping.Entries <= firstChunk.Document.Mapping.Entries {
+		t.Errorf("mapping entries did not grow: %d then %d", firstChunk.Document.Mapping.Entries, secondChunk.Document.Mapping.Entries)
+	}
+	if _, _, err := state.LoadMapping(ctx, destination.Git, secondChunk.State.Commit); err != nil {
+		t.Fatalf("completed state has no reachable mapping evidence: %v", err)
+	}
+	applied, err = enginesync.ApplyCheckpoint(ctx, secondChunk, secondChunk.Publish.Hash(), false)
+	if err != nil {
+		t.Fatalf("apply resumed checkpoint: %v", err)
+	}
+	observed = remoteRefMap(ctx, t, destination.Git, remotePath, format.HexLength())
+	if observed["refs/heads/main"] != consumerHead {
+		t.Fatalf("consumer branch moved after completed checkpoint: %s, want %s", observed["refs/heads/main"], consumerHead)
+	}
+	finalDiscovery := &enginesync.Discovery{
+		Format: format, Observed: observed,
+		StateCommit: secondChunk.State.Commit, State: secondChunk.Document,
+		Pending: []enginesync.PendingRelease{{Source: release, DestinationTag: nextModuleTag}},
+	}
+	e.opts.Config.Publication.Mode = config.PublicationModeManual
+	manualPlan, err := enginesync.PlanFinal(ctx, enginesync.FinalizeOptions{
+		Config: e.opts.Config, Discovery: finalDiscovery, SourceCache: cache,
+		Destination: destinationConfig, Generate: e.opts, Release: release,
+	})
+	if err != nil {
+		t.Fatalf("plan manual final consumer publication: %v", err)
+	}
+	if _, err := enginesync.ApplyTrusted(ctx, manualPlan); err == nil || !strings.Contains(err.Error(), "publication mode") {
+		t.Fatalf("trusted apply in manual mode = %v, want publication-mode refusal", err)
+	}
+	e.opts.Config.Publication.Mode = config.PublicationModeAutomatic
+	finalPlan, err := enginesync.PlanFinal(ctx, enginesync.FinalizeOptions{
+		Config: e.opts.Config, Discovery: finalDiscovery, SourceCache: cache,
+		Destination: destinationConfig, Generate: e.opts, Release: release,
+	})
+	if err != nil {
+		t.Fatalf("plan final consumer publication: %v", err)
+	}
+	if finalPlan.Manifest.Hash == "" {
+		t.Fatal("final consumer plan has no synchronization hash")
+	}
+	trusted, err := enginesync.ApplyTrusted(ctx, finalPlan)
+	if err != nil {
+		t.Fatalf("apply trusted finalization: %v", err)
+	}
+	if trusted.Publication == nil || trusted.Reconciliation == nil || trusted.State.Commit == "" {
+		t.Fatalf("trusted apply result = %#v, want publication and reconciliation", trusted)
+	}
+	observed = remoteRefMap(ctx, t, destination.Git, remotePath, format.HexLength())
+	if observed["refs/heads/main"] != secondChunk.Track.Destination {
+		t.Errorf("final consumer branch = %s, want %s", observed["refs/heads/main"], secondChunk.Track.Destination)
+	}
+	if observed["refs/tags/"+nextModuleTag] != finalPlan.Manifest.Objects.Tag {
+		t.Errorf("final release tag = %s, want %s", observed["refs/tags/"+nextModuleTag], finalPlan.Manifest.Objects.Tag)
+	}
+	if observed[e.opts.Config.Destination.StateRef] != trusted.State.Commit {
+		t.Errorf("reconciled state = %s, want %s", observed[e.opts.Config.Destination.StateRef], trusted.State.Commit)
+	}
+	reconciled, err := state.Load(ctx, destination.Git, trusted.State.Commit)
+	if err != nil {
+		t.Fatalf("load reconciled state: %v", err)
+	}
+	if len(reconciled.Tracks) != 0 {
+		t.Errorf("reconciled state retains completed tracks: %#v", reconciled.Tracks)
+	}
+	published := map[string]state.Published{}
+	for _, entry := range reconciled.Published {
+		published[entry.Ref] = entry
+	}
+	if published["refs/heads/main"].Object != secondChunk.Track.Destination ||
+		published["refs/tags/"+nextModuleTag].Object != finalPlan.Manifest.Objects.Tag {
+		t.Errorf("reconciled published refs = %#v", published)
+	}
+	if err := destination.Git.UpdateRef(ctx, "refs/heads/main", secondChunk.Track.Destination, consumerHead); err != nil {
+		t.Fatalf("advance local branch to reconciled consumer head: %v", err)
+	}
+	if err := destination.Git.UpdateRef(ctx, e.opts.Config.Destination.StateRef, trusted.State.Commit, priorRecord.Commit); err != nil {
+		t.Fatalf("advance local state ref: %v", err)
+	}
+	e.opts.Config.Source.Refs.AnchorCommit = e.upstream.commit
+	reconcileDestination := destinationConfig
+	reconcileDestination.Identity = "github.com/" + e.opts.Config.Destination.Repository
+	fixed, err := enginesync.Reconcile(ctx, enginesync.ReconcileOptions{
+		Config: e.opts.Config, SourceCache: cache,
+		LocalGit:    destination.Git.Anonymous().WithNoLazyFetch(),
+		Destination: reconcileDestination, Generate: e.opts, Automatic: true,
+	})
+	if err != nil {
+		t.Fatalf("reconcile fixed point: %v", err)
+	}
+	if !fixed.FixedPoint || len(fixed.Actions) != 0 {
+		t.Errorf("fixed reconciliation = %#v, want no actions", fixed)
+	}
+}
+
+func remoteRefMap(ctx context.Context, t *testing.T, git *gitcli.Runner, remote string, width int) map[string]string {
+	t.Helper()
+	refs, err := git.RemoteRefs(ctx, remote, width)
+	if err != nil {
+		t.Fatalf("list remote refs: %v", err)
+	}
+	result := make(map[string]string, len(refs))
+	for _, ref := range refs {
+		result[ref.Name] = ref.Target
+	}
+	return result
 }
 
 // TestGenerateProvesPruningKeptThePublicAPI covers the gate the whole pre-prune

@@ -110,13 +110,14 @@ func facadeSpec(cfg *config.Config) (facade.Spec, error) {
 		if err != nil {
 			return facade.Spec{}, fmt.Errorf("facade entry %s: %w", entry.Name, err)
 		}
-		spec.Exports = append(spec.Exports, facade.Export{Name: entry.Name, Kind: kind, Source: entry.Source})
+		spec.Exports = append(spec.Exports, facade.Export{Name: entry.Name, Kind: kind, Source: entry.Source, Direct: entry.Direct})
 	}
 	for _, assertion := range cfg.Facade.InterfaceAssertions {
 		spec.Assertions = append(spec.Assertions, facade.Assertion{
 			Type:      assertion.Type,
 			Pointer:   assertion.Pointer,
 			Interface: assertion.Interface,
+			Local:     assertion.Local,
 		})
 	}
 	return spec, nil

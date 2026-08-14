@@ -22,7 +22,7 @@ func TestDecodeRejectsInvalidProfiles(t *testing.T) {
 	}{
 		{
 			name:      "unknown field",
-			mutations: []mutation{{old: "version: 1\n", new: "version: 1\nunknownField: true\n"}},
+			mutations: []mutation{{old: "version: 2\n", new: "version: 2\nunknownField: true\n"}},
 			want:      "field unknownField not found",
 		},
 		{
@@ -32,8 +32,8 @@ func TestDecodeRejectsInvalidProfiles(t *testing.T) {
 		},
 		{
 			name:      "unsupported schema version",
-			mutations: []mutation{{old: "version: 1\n", new: "version: 2\n"}},
-			want:      "unsupported schema version 2",
+			mutations: []mutation{{old: "version: 2\n", new: "version: 3\n"}},
+			want:      "unsupported schema version 3",
 		},
 		{
 			name:      "insecure source scheme",
@@ -473,21 +473,7 @@ func TestDecodeRejectsInvalidProfiles(t *testing.T) {
 			mutations: []mutation{{old: "probeURL: https://monis.app/kk/rbac_authorizer?go-get=1", new: "probeURL: https://github.com/kk/rbac_authorizer?go-get=1"}},
 			want:      "which is not one of monis.app",
 		},
-		{
-			name:      "duplicate GitHub App environment names",
-			mutations: []mutation{{old: "installationIDEnv: SOAPBOX_GITHUB_INSTALLATION_ID", new: "installationIDEnv: SOAPBOX_GITHUB_APP_ID"}},
-			want:      "duplicate environment variable name",
-		},
-		{
-			name:      "lower case environment name",
-			mutations: []mutation{{old: "appIDEnv: SOAPBOX_GITHUB_APP_ID", new: "appIDEnv: soapbox_app_id"}},
-			want:      "must be upper case with underscores",
-		},
-		{
-			name:      "API base URL host is not allowed",
-			mutations: []mutation{{old: "apiBaseURL: https://api.github.com", new: "apiBaseURL: https://github.com"}},
-			want:      "which is not one of api.github.com",
-		},
+
 		{
 			name:      "toolchain is not an exact patch release",
 			mutations: []mutation{{old: "toolchain: go1.26.5", new: "toolchain: go1.26"}},
@@ -497,6 +483,16 @@ func TestDecodeRejectsInvalidProfiles(t *testing.T) {
 			name:      "chunk size is zero",
 			mutations: []mutation{{old: "chunkSize: 200", new: "chunkSize: 0"}},
 			want:      "determinism.chunkSize: must be greater than zero",
+		},
+		{
+			name:      "unsupported publication mode",
+			mutations: []mutation{{old: "mode: manual", new: "mode: scheduled"}},
+			want:      "publication.mode: unsupported value",
+		},
+		{
+			name:      "unsupported compatibility apiserver",
+			mutations: []mutation{{old: "apiserver: external", new: "apiserver: hybrid"}},
+			want:      "compatibility.apiserver: unsupported value",
 		},
 		{
 			name: "recursive root cannot deny a package below itself",
@@ -583,7 +579,7 @@ func TestDecodeNeverEchoesCredentials(t *testing.T) {
 		},
 		{
 			name:      "unparseable URL with credentials",
-			mutations: []mutation{{old: "apiBaseURL: https://api.github.com", new: "apiBaseURL: https://" + token + "@api.github.com/%zz"}},
+			mutations: []mutation{{old: "repositoryURL: https://github.com/enj/rbac_authorizer", new: "repositoryURL: https://" + token + "@github.com/enj/rbac_authorizer/%zz"}},
 		},
 		{
 			name:      "control character in a credential URL",

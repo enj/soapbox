@@ -187,6 +187,53 @@ func TestPlanIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestPlanExactCommitUsesThePrefetchedCache(t *testing.T) {
+	ctx := t.Context()
+	up := newUpstream(ctx, t)
+	opts := planOptions(ctx, t, up, fixtureProfile)
+
+	tagged := mustPlan(ctx, t, opts)
+	opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: tagged.Report.Source.Commit}
+	opts.Fetch = false
+	exact := mustPlan(ctx, t, opts)
+
+	if exact.Report.Source.RefKind != string(extract.RefCommit) {
+		t.Errorf("ref kind = %q, want %q", exact.Report.Source.RefKind, extract.RefCommit)
+	}
+	if exact.Report.Source.RefName != tagged.Report.Source.Commit || exact.Report.Source.Ref != tagged.Report.Source.Commit {
+		t.Errorf("exact source = name %q ref %q, want %s", exact.Report.Source.RefName, exact.Report.Source.Ref, tagged.Report.Source.Commit)
+	}
+	if exact.Report.Source.Fetched {
+		t.Error("exact commit run reports a fetch")
+	}
+	if exact.Report.Output.ManifestHash != tagged.Report.Output.ManifestHash {
+		t.Errorf("exact commit manifest = %s, tagged manifest = %s", exact.Report.Output.ManifestHash, tagged.Report.Output.ManifestHash)
+	}
+}
+
+func TestPlanExactCommitRefusesFetchAndMissingObjects(t *testing.T) {
+	ctx := t.Context()
+	up := newUpstream(ctx, t)
+	opts := planOptions(ctx, t, up, fixtureProfile)
+	opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: strings.Repeat("f", 40)}
+
+	_, err := extract.Plan(ctx, opts)
+	if err == nil || !strings.Contains(err.Error(), "cannot be fetched by object name") {
+		t.Fatalf("fetching exact commit = %v, want a fetch refusal", err)
+	}
+
+	// Prime the cache through a trusted tag fetch, then ask for an object that
+	// was not reachable from it. ResolveCommit must not contact the promisor.
+	opts.Ref = extract.Ref{Kind: extract.RefTag, Name: fixtureTag}
+	mustPlan(ctx, t, opts)
+	opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: strings.Repeat("f", 40)}
+	opts.Fetch = false
+	_, err = extract.Plan(ctx, opts)
+	if err == nil || !strings.Contains(err.Error(), "missing from the cache") {
+		t.Fatalf("missing exact commit = %v, want a cache-miss refusal", err)
+	}
+}
+
 // TestPlanReportCarriesNoLocalState checks that nothing about the machine the
 // plan ran on reaches the report.
 func TestPlanReportCarriesNoLocalState(t *testing.T) {
@@ -483,13 +530,13 @@ func TestPlanRefusesCredentials(t *testing.T) {
 	t.Run("environment", func(t *testing.T) {
 		opts := planOptions(ctx, t, up, fixtureProfile)
 		opts.LookupEnv = func(name string) (string, bool) {
-			return "a-private-key", name == "SOAPBOX_GITHUB_APP_PRIVATE_KEY"
+			return "fake-credential-for-test", name == "SOAPBOX_GITHUB_TOKEN"
 		}
 		_, err := extract.Plan(ctx, opts)
 		if !errors.Is(err, extract.ErrCredentialEnvironment) {
 			t.Fatalf("error %v does not refuse the credential environment", err)
 		}
-		if strings.Contains(err.Error(), "a-private-key") {
+		if strings.Contains(err.Error(), "fake-credential-for-test") {
 			t.Fatalf("the refusal leaks the credential value: %v", err)
 		}
 	})

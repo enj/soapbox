@@ -143,3 +143,102 @@ func TestValidateRawDate(t *testing.T) {
 		})
 	}
 }
+
+const fullTagObjectFixture = "object 1111111111111111111111111111111111111111\n" +
+	"type commit\n" +
+	"tag v0.36.1\n" +
+	"tagger Soapbox Bot <bot@example.com> 1700000000 +0000\n\n" +
+	"release\n"
+
+func TestParseFullTagObject(t *testing.T) {
+	got, err := parseFullTagObject(fullTagObjectFixture)
+	if err != nil {
+		t.Fatalf("parse tag object: %v", err)
+	}
+	if got.TargetOID != "1111111111111111111111111111111111111111" {
+		t.Errorf("target OID = %q", got.TargetOID)
+	}
+	if got.TargetType != "commit" {
+		t.Errorf("target type = %q", got.TargetType)
+	}
+	if got.InternalName != "v0.36.1" {
+		t.Errorf("internal name = %q", got.InternalName)
+	}
+	if got.Tagger != (Signature{Name: "Soapbox Bot", Email: "bot@example.com", Date: "1700000000 +0000"}) {
+		t.Errorf("tagger = %#v", got.Tagger)
+	}
+	if got.Message != "release\n" {
+		t.Errorf("message = %q", got.Message)
+	}
+}
+
+func TestParseFullTagObjectRejectsMalformedMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "header without a value separator",
+			body: strings.Replace(fullTagObjectFixture, "type commit\n", "type commit\nunrecognized\n", 1),
+			want: "malformed header",
+		},
+		{
+			name: "unknown header",
+			body: strings.Replace(fullTagObjectFixture, "type commit\n", "type commit\nencoding UTF-8\n", 1),
+			want: "unknown header",
+		},
+		{
+			name: "duplicate header",
+			body: strings.Replace(fullTagObjectFixture, "type commit\n", "type commit\ntype commit\n", 1),
+			want: "duplicate type header",
+		},
+		{
+			name: "short object name",
+			body: strings.Replace(fullTagObjectFixture, strings.Repeat("1", 40), strings.Repeat("1", 39), 1),
+			want: "not a full object name",
+		},
+		{
+			name: "unsupported target type",
+			body: strings.Replace(fullTagObjectFixture, "type commit", "type widget", 1),
+			want: "not a valid git object type",
+		},
+		{
+			name: "invalid internal name",
+			body: strings.Replace(fullTagObjectFixture, "tag v0.36.1", "tag refs/tags/v0.36.1", 1),
+			want: "must be a short name",
+		},
+		{
+			name: "missing tagger name",
+			body: strings.Replace(fullTagObjectFixture, "Soapbox Bot <", "<", 1),
+			want: "tagger has no name",
+		},
+		{
+			name: "missing tagger email",
+			body: strings.Replace(fullTagObjectFixture, "bot@example.com", "", 1),
+			want: "tagger has no email address",
+		},
+		{
+			name: "invalid tagger date",
+			body: strings.Replace(fullTagObjectFixture, "1700000000 +0000", "not-a-date", 1),
+			want: "tagger date",
+		},
+		{
+			name: "missing message separator",
+			body: strings.Replace(fullTagObjectFixture, "\n\nrelease\n", "\nrelease\n", 1),
+			want: "no message separator",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseFullTagObject(test.body)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error %q does not contain %q", err, test.want)
+			}
+		})
+	}
+}

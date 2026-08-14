@@ -2,12 +2,16 @@ package state_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/enj/soapbox/tools/internal/gitcli"
+	"github.com/enj/soapbox/tools/internal/gomodmap"
 	"github.com/enj/soapbox/tools/internal/state"
 )
 
@@ -63,6 +67,114 @@ func TestStoreLoadRoundTrip(t *testing.T) {
 				if !slices.Equal(loaded.Published, doc.Published) {
 					t.Fatalf("loaded published %v, want %v", loaded.Published, doc.Published)
 				}
+			}
+			if _, _, err := state.LoadMapping(ctx, git, record.Commit); !errors.Is(err, state.ErrMappingEvidenceMissing) {
+				t.Fatalf("legacy mapping evidence = %v, want ErrMappingEvidenceMissing", err)
+			}
+		})
+	}
+}
+
+func TestStoreMakesMappingEvidenceReachableAndLoadVerifiesIt(t *testing.T) {
+	for _, format := range objectFormats {
+		t.Run(string(format), func(t *testing.T) {
+			ctx := t.Context()
+			git := newRepo(ctx, t, format)
+			index := gomodmap.NewIndex()
+			if err := index.Put(gomodmap.Entry{
+				Source: sha(format, "mapping-source"),
+				Tag:    "v1.36.1",
+				Modules: []gomodmap.ModuleVersion{{
+					Path: "k8s.io/api", Version: "v0.36.1", Commit: sha(format, "mapping-module"),
+				}},
+			}); err != nil {
+				t.Fatalf("build mapping index: %v", err)
+			}
+			mapping, err := gomodmap.Encode(index)
+			if err != nil {
+				t.Fatalf("encode mapping: %v", err)
+			}
+			object, err := git.WriteBlob(ctx, mapping)
+			if err != nil {
+				t.Fatalf("write mapping blob: %v", err)
+			}
+			sum := sha256.Sum256(mapping)
+			raw := base(format)
+			raw.Mapping = state.Mapping{
+				Digest:  "sha256:" + hex.EncodeToString(sum[:]),
+				Object:  object,
+				Entries: index.Len(),
+			}
+			doc := mustNew(t, raw)
+			opts := storeOptions(doc)
+			opts.Mapping = mapping
+			record, err := state.Store(ctx, git, opts)
+			if err != nil {
+				t.Fatalf("store mapping-backed state: %v", err)
+			}
+			if record.MappingBlob != object {
+				t.Errorf("record mapping blob = %s, want %s", record.MappingBlob, object)
+			}
+			inspected, err := state.Inspect(ctx, git, record.Commit)
+			if err != nil {
+				t.Fatalf("inspect state: %v", err)
+			}
+			if inspected != record {
+				t.Errorf("inspected record = %#v, want %#v", inspected, record)
+			}
+			entries, err := git.ListTree(ctx, record.Commit)
+			if err != nil {
+				t.Fatalf("list state tree: %v", err)
+			}
+			if !slices.ContainsFunc(entries, func(entry gitcli.TreeEntry) bool {
+				return entry.Path == state.MappingFile && entry.Object == object
+			}) {
+				t.Fatalf("state tree does not make mapping %s reachable: %#v", object, entries)
+			}
+			loaded, err := state.Load(ctx, git, record.Commit)
+			if err != nil {
+				t.Fatalf("load mapping-backed state: %v", err)
+			}
+			if loaded.Mapping != doc.Mapping {
+				t.Errorf("loaded mapping = %#v, want %#v", loaded.Mapping, doc.Mapping)
+			}
+			loadedBytes, loadedIndex, err := state.LoadMapping(ctx, git, record.Commit)
+			if err != nil {
+				t.Fatalf("load mapping evidence: %v", err)
+			}
+			if !slices.Equal(loadedBytes, mapping) || loadedIndex.Len() != index.Len() {
+				t.Errorf("loaded mapping = %d bytes/%d entries, want %d/%d", len(loadedBytes), loadedIndex.Len(), len(mapping), index.Len())
+			}
+
+			remoteRoot := t.TempDir()
+			remote, err := gitcli.New(ctx, gitcli.Options{Dir: remoteRoot, Inherit: []string{"PATH"}})
+			if err != nil {
+				t.Fatalf("create remote runner: %v", err)
+			}
+			if err := remote.InitRepositoryWithFormat(ctx, "main", format); err != nil {
+				t.Fatalf("init remote: %v", err)
+			}
+			if err := remote.SetConfigLocal(ctx, "core.bare", "true"); err != nil {
+				t.Fatalf("make remote bare: %v", err)
+			}
+			const stateRef = "refs/heads/soapbox-state"
+			if err := git.CreateRef(ctx, stateRef, record.Commit); err != nil {
+				t.Fatalf("create state ref: %v", err)
+			}
+			remotePath := filepath.Join(remoteRoot, ".git")
+			if err := git.PushAtomic(ctx, remotePath, []gitcli.PushUpdate{{Ref: stateRef, New: record.Commit, ExpectAbsent: true}}); err != nil {
+				t.Fatalf("push state record: %v", err)
+			}
+			fresh := newRepo(ctx, t, format)
+			if err := fresh.FetchExact(ctx, remotePath, stateRef, record.Commit, format.HexLength()); err != nil {
+				t.Fatalf("fetch exact state record: %v", err)
+			}
+			fetchedBytes, fetchedIndex, err := state.LoadMapping(ctx, fresh, record.Commit)
+			if err != nil {
+				t.Fatalf("load fetched mapping evidence: %v", err)
+			}
+			if !slices.Equal(fetchedBytes, mapping) || fetchedIndex.Len() != index.Len() {
+				t.Errorf("fetched mapping = %d bytes/%d entries, want %d/%d", len(fetchedBytes), fetchedIndex.Len(), len(mapping), index.Len())
 			}
 		})
 	}

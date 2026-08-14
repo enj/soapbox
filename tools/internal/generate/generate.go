@@ -1,6 +1,6 @@
 // Package generate composes the engine's extraction, staging, module, facade,
 // type, dependency, and provenance phases into one complete generated module
-// for a single upstream release tag.
+// for an upstream release tag or a release-bounded exact commit.
 //
 // A plan answers what the extracted tree would contain. A generation answers
 // what the published module would be: the same relocated code, plus the go.mod
@@ -42,6 +42,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +53,7 @@ import (
 	"github.com/enj/soapbox/tools/internal/extract"
 	"github.com/enj/soapbox/tools/internal/facade"
 	"github.com/enj/soapbox/tools/internal/gitcli"
+	"github.com/enj/soapbox/tools/internal/gitgraph"
 	"github.com/enj/soapbox/tools/internal/gocli"
 	"github.com/enj/soapbox/tools/internal/gomodmap"
 	"github.com/enj/soapbox/tools/internal/modgen"
@@ -71,13 +73,8 @@ var (
 	// ErrPathConflict reports directories that overlap when they must not.
 	ErrPathConflict = errors.New("the generation directories conflict")
 	// ErrUnsupported reports a run shape this engine refuses rather than
-	// approximates.
-	//
-	// It is a distinct error because the two shapes it covers are not failures
-	// of the profile or of the code. An intermediate ref and an approved staging
-	// copy are both things the design calls for and this first engine does not
-	// implement, and the honest answer to either is that the engine cannot
-	// produce the module rather than that the module is unacceptable.
+	// approximates. Moving branch names remain preview inputs; reconciliation
+	// resolves and supplies immutable commits instead.
 	ErrUnsupported = errors.New("this generation engine does not support the requested run")
 )
 
@@ -96,6 +93,14 @@ const resolverModulePath = "soapbox.invalid/resolver"
 // directories no matter where the process was started from, and because the run
 // adopts none of them: the cache and work roots are created if absent and owned
 // by the run thereafter, and the output tree must not exist at all.
+// StagingSource names the trusted history used to resolve one intermediate
+// Kubernetes staging module. Reconciliation derives the production URL from the
+// module path; local fixtures may override it only while the source itself is
+// also overridden to a local repository.
+type StagingSource struct {
+	Remote string
+}
+
 type Options struct {
 	// Config is the decoded, validated profile.
 	Config *config.Config
@@ -113,9 +118,23 @@ type Options struct {
 	// StorePath is the version index file the staging resolution caches into.
 	// It is absolute, and the run creates it if it is absent.
 	StorePath string
-	// Ref selects the upstream ref to generate from. Only a release tag is
-	// supported: see ErrUnsupported.
+	// Ref selects the upstream source. Release tags are public inputs; the
+	// reconciliation engine also supplies exact commits already fetched through a
+	// bounded release head. Branches remain unsupported.
 	Ref extract.Ref
+	// ReleaseContext is the upstream release whose bounded history contains an
+	// exact commit. It is required for RefCommit and empty for RefTag, where Ref
+	// itself is the release. Dependency override expiry and staging history use
+	// this context without claiming the intermediate commit is tagged.
+	ReleaseContext string
+	// HistoryAnchor and HistoryAnchorRelease bound intermediate source and
+	// staging walks to the last published release, inclusive.
+	HistoryAnchor        string
+	HistoryAnchorRelease string
+	// StagingSources supplies the trusted repository for each staging module
+	// when an intermediate index entry must be resolved. It must name exactly the
+	// required modules; a cached index hit needs no repositories.
+	StagingSources map[string]StagingSource
 	// PatchBranch is the tracked branch a patch's branch selector is matched
 	// against. It is required only when the profile carries patches.
 	PatchBranch string
@@ -376,6 +395,15 @@ type run struct {
 	// types is the type policy analysis, which the root provenance reads so a
 	// documented behaviour change cannot be forgotten.
 	types *typeswap.Result
+	// compatibilityChanges document intentional API differences introduced by
+	// the selected compatibility mode.
+	compatibilityChanges []provenance.BehaviorChange
+
+	// copyFiles are the materialized staging copies, ready for composition.
+	copyFiles relocate.FileSet
+	// copyEvidence records the measured identity and provenance of each
+	// staging module whose packages were copied, keyed by module path.
+	copyEvidence map[string]copyEvidence
 
 	// worktrees are the scratch source trees to remove on the way out.
 	worktrees []string
@@ -394,6 +422,7 @@ func newRun(ctx context.Context, opts Options) (*run, error) {
 	// original pointer in Options would leave report initialization exposed to a
 	// caller mutating a nested slice while the run is active.
 	opts.Config = cloned
+	opts.StagingSources = maps.Clone(opts.StagingSources)
 	loaderEnv, err := opts.Go.LoaderEnv(ctx)
 	if err != nil {
 		return nil, runtimeError(stageOptions, fmt.Errorf("loader environment: %w", err))
@@ -452,6 +481,7 @@ func (r *run) execute(ctx context.Context) error {
 	}{
 		{stageExtract, r.runExtract},
 		{stageStaging, r.runStaging},
+		{stageCompatibility, r.runCompatibility},
 		{stageModule, r.runModule},
 		{stageFacade, r.runFacade},
 		{stageTypes, r.runTypes},
@@ -474,16 +504,17 @@ func (r *run) execute(ctx context.Context) error {
 // stage names, shared by the driver, the PolicyError values each phase raises,
 // and the report.
 const (
-	stageOptions      = "options"
-	stageExtract      = "extract"
-	stageStaging      = "staging"
-	stageModule       = "module"
-	stageFacade       = "facade"
-	stageTypes        = "types"
-	stageDependencies = "dependencies"
-	stageProvenance   = "provenance"
-	stageOutput       = "output"
-	stageCleanup      = "cleanup"
+	stageOptions       = "options"
+	stageExtract       = "extract"
+	stageStaging       = "staging"
+	stageCompatibility = "compatibility"
+	stageModule        = "module"
+	stageFacade        = "facade"
+	stageTypes         = "types"
+	stageDependencies  = "dependencies"
+	stageProvenance    = "provenance"
+	stageOutput        = "output"
+	stageCleanup       = "cleanup"
 )
 
 // result renders what the run measured, whether or not it finished.
@@ -562,27 +593,62 @@ func (o Options) check() error {
 	return o.checkCredentialEnvironment()
 }
 
-// checkRef refuses the ref shapes this engine does not implement.
+// checkRef accepts reviewed release tags and engine-selected exact commits.
 //
-// A branch or any other intermediate commit needs the pseudo-version resolution
-// path, which maps the source commit onto the staging commit that carries it and
-// asks the toolchain what names it. That path exists and is tested, but it needs
-// staging repository URLs this engine has no verified way to derive, and
-// guessing one would pin the generated module to code from a repository nobody
-// checked. Refusing is the only answer that cannot publish something upstream
-// never built.
+// Exact commits must already be present in a release-bounded source cache and
+// carry the release context used for dependency gates and staging history.
+// Branches remain a human preview input: reconciliation resolves their commits
+// itself rather than letting a moving name enter generation.
 func (o Options) checkRef() error {
 	switch o.Ref.Kind {
 	case extract.RefTag:
+		if o.HistoryAnchor != "" || o.HistoryAnchorRelease != "" {
+			return errors.New("generate: a release tag needs no intermediate history anchor")
+		}
+		if len(o.StagingSources) != 0 {
+			return errors.New("generate: a release tag resolves staging modules by tag, so StagingSources must be empty")
+		}
+		if o.ReleaseContext != "" {
+			return errors.New("generate: a release tag is its own release context, so ReleaseContext must be empty")
+		}
+	case extract.RefCommit:
+		if err := gitgraph.ValidateSHA(o.Ref.Name); err != nil {
+			return fmt.Errorf("generate: exact source commit: %w", err)
+		}
+		if o.ReleaseContext == "" {
+			return errors.New("generate: an exact source commit requires its bounding release context")
+		}
+		if o.HistoryAnchor == "" || o.HistoryAnchorRelease == "" {
+			return errors.New("generate: an exact source commit requires its published history anchor and release")
+		}
+		if err := gitgraph.ValidateSHA(o.HistoryAnchor); err != nil {
+			return fmt.Errorf("generate: intermediate history anchor: %w", err)
+		}
+		if _, err := config.ParseSemver(o.HistoryAnchorRelease); err != nil {
+			return fmt.Errorf("generate: intermediate history anchor release: %w", err)
+		}
+		if _, err := config.ParseSemver(o.ReleaseContext); err != nil {
+			return fmt.Errorf("generate: exact source commit release context: %w", err)
+		}
+		if o.Fetch {
+			return errors.New("generate: an exact source commit must already be present in the cache, so it cannot be fetched by object name")
+		}
 	case extract.RefBranch:
-		return policyError(stageOptions, fmt.Errorf("%w: ref %s is a branch, and only a release tag can be generated from until intermediate staging resolution is wired to verified repository URLs", ErrUnsupported, o.Ref))
+		return policyError(stageOptions, fmt.Errorf("%w: ref %s is a branch, and only a release tag or an engine-selected exact commit can be generated", ErrUnsupported, o.Ref))
 	default:
-		return fmt.Errorf("generate: ref kind %q must be %s", o.Ref.Kind, extract.RefTag)
+		return fmt.Errorf("generate: ref kind %q must be %s or %s", o.Ref.Kind, extract.RefTag, extract.RefCommit)
 	}
 	if o.Ref.Name == "" {
 		return errors.New("generate: a ref name is required")
 	}
 	return nil
+}
+
+func (o Options) sourceRelease() string {
+	if o.Ref.Kind == extract.RefCommit {
+		return o.ReleaseContext
+	}
+	return o.Ref.Name
 }
 
 // checkPaths proves every directory is absolute and that none of them contains
@@ -692,8 +758,8 @@ func contains(outer, inner string) bool {
 // The anonymous runner already keeps caller supplied values away from every
 // subprocess, so this is about the operator rather than the subprocess. A
 // generation produces a candidate module and gates it; it never publishes one,
-// so it has no use for a credential at all, and a machine holding the App's
-// private key while running it is a sign the wrong command is being used.
+// so it has no use for a credential at all, and a machine holding a publishing
+// token while running it is a sign the wrong command is being used.
 func (o Options) checkCredentialEnvironment() error {
 	lookup := o.LookupEnv
 	if lookup == nil {
@@ -701,9 +767,7 @@ func (o Options) checkCredentialEnvironment() error {
 	}
 	var present []string
 	for _, name := range []string{
-		o.Config.GitHubApp.AppIDEnv,
-		o.Config.GitHubApp.InstallationIDEnv,
-		o.Config.GitHubApp.PrivateKeyEnv,
+		"SOAPBOX_GITHUB_TOKEN",
 	} {
 		if name == "" {
 			continue

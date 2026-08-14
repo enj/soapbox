@@ -13,7 +13,7 @@ package generate_test
 // the internal API, a deny list naming the internal API package, and a curated
 // facade with an interface assertion against a real external interface.
 const fixtureProfile = `
-version: 1
+version: 2
 
 source:
   repository: REPOSITORY
@@ -65,13 +65,14 @@ closure:
   # The limits admit the UNPRUNED closure, not just the pruned one. The baseline
   # pass runs the same limits against a strictly larger package set, so a profile
   # whose ceilings only fit the pruned result refuses before it ever reaches the
-  # facade comparison. Growth is 3 here: one root reaches validation, the
-  # versioned API helpers, and the unversioned API package the prune removes.
+  # facade comparison. Growth is 4 here: one root reaches validation, the
+  # versioned API helpers, the component-helpers validation package, and the
+  # unversioned API package the prune removes.
   limits:
-    maxPackages: 8
+    maxPackages: 10
     maxFiles: 40
     maxNonTestLines: 5000
-    maxPackageGrowth: 4
+    maxPackageGrowth: 5
   # The golden is deliberately not written by these tests. An absent golden is
   # an advisory notice rather than a refusal, which is exactly the signal the
   # strict mode test needs: a notice that has to stop the run before any output
@@ -87,6 +88,7 @@ types:
 dependencies:
   policy: external
   copyPackages: []
+  forbiddenModules: []
   gates:
     interoperability: true
     globalState: true
@@ -157,11 +159,10 @@ vanity:
   repositoryURL: https://github.com/enj/rbac_authorizer
   probeURL: https://monis.app/kk/rbac_authorizer?go-get=1
 
-githubApp:
-  appIDEnv: SOAPBOX_TEST_GITHUB_APP_ID
-  installationIDEnv: SOAPBOX_TEST_GITHUB_INSTALLATION_ID
-  privateKeyEnv: SOAPBOX_TEST_GITHUB_APP_PRIVATE_KEY
-  apiBaseURL: https://api.github.com
+publication:
+  mode: automatic
+compatibility:
+  apiserver: external
 
 determinism:
   toolchain: go1.26.5

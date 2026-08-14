@@ -28,6 +28,38 @@ type sourceFixture struct {
 	commits map[string]string
 }
 
+func TestStagingRepository(t *testing.T) {
+	tests := []struct {
+		module string
+		want   string
+	}{
+		{module: "k8s.io/api", want: "https://github.com/kubernetes/api.git"},
+		{module: "k8s.io/component-helpers", want: "https://github.com/kubernetes/component-helpers.git"},
+		{module: ""},
+		{module: "k8s.io"},
+		{module: "example.com/api"},
+		{module: "k8s.io/"},
+		{module: "k8s.io/api/v2"},
+	}
+	for _, test := range tests {
+		t.Run(test.module, func(t *testing.T) {
+			got, err := gomodmap.StagingRepository(test.module)
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("StagingRepository(%q) = %q, want an error", test.module, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("StagingRepository(%q): %v", test.module, err)
+			}
+			if got != test.want {
+				t.Errorf("StagingRepository(%q) = %q, want %q", test.module, got, test.want)
+			}
+		})
+	}
+}
+
 func newSourceFixture(ctx context.Context, t *testing.T) *sourceFixture {
 	t.Helper()
 
@@ -420,6 +452,47 @@ func TestNewSourceMainline_Bounded(t *testing.T) {
 	}
 	if mainline.Head() != source.sha(t, "s4") {
 		t.Errorf("head = %s, want the tip %s", mainline.Head(), source.sha(t, "s4"))
+	}
+}
+
+func TestNewSourceMainline_AnchorIsInclusive(t *testing.T) {
+	ctx := t.Context()
+	source := newSourceFixture(ctx, t)
+	mainline, err := gomodmap.NewSourceMainline(ctx, source.repo.Git, gomodmap.MainlineOptions{
+		Revision: source.sha(t, "s4"),
+		Anchor:   source.sha(t, "s2"),
+	})
+	if err != nil {
+		t.Fatalf("new bounded source mainline: %v", err)
+	}
+	if mainline.Len() != 3 {
+		t.Errorf("mainline covers %d commits, want s4, s3, and inclusive s2", mainline.Len())
+	}
+	if mainline.Head() != source.sha(t, "s4") {
+		t.Errorf("head = %s, want %s", mainline.Head(), source.sha(t, "s4"))
+	}
+}
+
+func TestNewStagingIndex_AnchorIsInclusive(t *testing.T) {
+	ctx := t.Context()
+	source := newSourceFixture(ctx, t)
+	staging := newStagingFixture(ctx, t, []string{
+		claim("publish base", source.sha(t, "s0")),
+		claim("publish anchor", source.sha(t, "s2")),
+		claim("publish head", source.sha(t, "s4")),
+	})
+	commits, err := staging.Git.CommitLog(ctx, gitcli.CommitLogOptions{Include: []string{"HEAD"}})
+	if err != nil {
+		t.Fatalf("read staging commits: %v", err)
+	}
+	index, err := gomodmap.NewStagingIndex(ctx, staging.Git, gomodmap.IndexOptions{
+		ModulePath: "k8s.io/api", Revision: commits[2].SHA, Anchor: commits[1].SHA,
+	})
+	if err != nil {
+		t.Fatalf("new bounded staging index: %v", err)
+	}
+	if index.Len() != 2 {
+		t.Errorf("staging index has %d claims, want anchor and head", index.Len())
 	}
 }
 

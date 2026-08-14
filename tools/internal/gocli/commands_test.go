@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -603,4 +604,125 @@ func TestOutputLimitIsEnforced(t *testing.T) {
 func buildVersionStandIn(t *testing.T, line string) string {
 	t.Helper()
 	return buildStandInSource(t, "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Print("+strconv.Quote(line)+")\n}\n")
+}
+
+func TestListModuleVersionsDecodesVersionList(t *testing.T) {
+	// A stand-in emits deterministic JSON containing multiple versions
+	// including a retracted one, plus unknown fields the struct deliberately
+	// does not declare. This proves the decoder populates Versions (including
+	// retracted) and ignores extra keys rather than failing.
+	response := `{
+	"Path": "example.com/helpers",
+	"Version": "v0.36.1",
+	"Versions": ["v0.35.0", "v0.35.1", "v0.36.0", "v0.36.0-retracted", "v0.36.1"],
+	"Retracted": ["v0.36.0-retracted is broken"],
+	"Update": {"Path": "example.com/helpers", "Version": "v0.37.0"},
+	"GoVersion": "1.26.0"
+}
+`
+	standIn := buildStandInSource(t,
+		"package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Print("+strconv.Quote(response)+")\n}\n")
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "go.mod"), testGoMod)
+	runner := buildRunner(t, gocli.Options{Binary: standIn, Dir: dir, Proxy: offline})
+
+	results, err := runner.ListModuleVersions(t.Context(), "example.com/helpers")
+	if err != nil {
+		t.Fatalf("list module versions: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("got %d results, want 1", len(results))
+	}
+	m := results[0]
+	if m.Path != "example.com/helpers" {
+		t.Errorf("path = %q, want example.com/helpers", m.Path)
+	}
+	if m.Version != "v0.36.1" {
+		t.Errorf("version = %q, want v0.36.1", m.Version)
+	}
+	wantVersions := []string{"v0.35.0", "v0.35.1", "v0.36.0", "v0.36.0-retracted", "v0.36.1"}
+	if !slices.Equal(m.Versions, wantVersions) {
+		t.Errorf("versions = %v, want %v", m.Versions, wantVersions)
+	}
+	if m.Error != nil {
+		t.Errorf("unexpected error: %s", m.Error.Err)
+	}
+}
+
+func TestListModuleVersionsReportsErrors(t *testing.T) {
+	runner, _ := newModule(t, testGoMod, "package z\n", offline)
+
+	// An absent module with GOPROXY=off should report a per-module error.
+	results, err := runner.ListModuleVersions(t.Context(), "example.com/absent@v1.0.0")
+	if err != nil {
+		t.Fatalf("list module versions: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("got 0 results, want at least 1")
+	}
+	hasError := false
+	for _, r := range results {
+		if r.Error != nil {
+			hasError = true
+		}
+	}
+	if !hasError {
+		t.Error("absent module with offline proxy reported no error")
+	}
+}
+
+func TestListModuleVersionsRejectsEmptyQueries(t *testing.T) {
+	runner, _ := newModule(t, testGoMod, "package z\n", offline)
+
+	_, err := runner.ListModuleVersions(t.Context())
+	if err == nil {
+		t.Fatal("empty query list was accepted")
+	}
+}
+
+func TestListModuleVersionsRejectsHostileQueries(t *testing.T) {
+	runner, _ := newModule(t, testGoMod, "package z\n", offline)
+
+	for _, query := range []string{"-flag", "--option=value"} {
+		_, err := runner.ListModuleVersions(t.Context(), query)
+		if err == nil {
+			t.Errorf("hostile query %q was accepted", query)
+		}
+	}
+}
+
+func TestModCacheRWMakesWritableCache(t *testing.T) {
+	runner, err := gocli.New(t.Context(), isolatedOptions(t, gocli.Options{
+		Dir:        t.TempDir(),
+		ModCacheRW: true,
+	}))
+	if err != nil {
+		t.Fatalf("create runner: %v", err)
+	}
+
+	// The GOFLAGS should contain -modcacherw.
+	values, err := runner.Env(t.Context(), "GOFLAGS")
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	if !strings.Contains(values["GOFLAGS"], "-modcacherw") {
+		t.Errorf("GOFLAGS = %q, want it to contain -modcacherw", values["GOFLAGS"])
+	}
+}
+
+func TestModCacheRWDefaultOff(t *testing.T) {
+	runner, err := gocli.New(t.Context(), isolatedOptions(t, gocli.Options{
+		Dir: t.TempDir(),
+	}))
+	if err != nil {
+		t.Fatalf("create runner: %v", err)
+	}
+
+	values, err := runner.Env(t.Context(), "GOFLAGS")
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	if values["GOFLAGS"] != "" {
+		t.Errorf("GOFLAGS = %q, want empty when ModCacheRW is not set", values["GOFLAGS"])
+	}
 }

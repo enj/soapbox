@@ -482,6 +482,49 @@ func TestMergeAcrossAnEpoch(t *testing.T) {
 	}
 }
 
+type restrictedAncestry struct {
+	inner   state.Ancestry
+	allowed map[string]bool
+}
+
+func (a restrictedAncestry) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	if !a.allowed[ancestor] || !a.allowed[descendant] {
+		return false, errors.New("ancestry question reached the wrong repository")
+	}
+	return a.inner.IsAncestor(ctx, ancestor, descendant)
+}
+
+func TestMergeWithUsesSeparateSourceAndDestinationGraphs(t *testing.T) {
+	ctx := t.Context()
+	g := newGraph(ctx, t, gitcli.ObjectFormatSHA1)
+	prev := g.document(t)
+	next := prev.Clone()
+	next.Digest = ""
+	next.Epoch.Profile = digest("separate graph profile")
+	next.Epoch.Source = g.source[3]
+	next.Epoch.Destination = g.dest[3]
+	next.Cursors[0].Source = g.source[3]
+	next.Cursors[0].Destination = g.destFork
+
+	sourceAllowed := map[string]bool{g.srcFork: true}
+	for _, commit := range g.source {
+		sourceAllowed[commit] = true
+	}
+	destinationAllowed := map[string]bool{g.destFork: true}
+	for _, commit := range g.dest {
+		destinationAllowed[commit] = true
+	}
+	merged, err := state.MergeWith(ctx, prev, next,
+		restrictedAncestry{inner: g.git, allowed: sourceAllowed},
+		restrictedAncestry{inner: g.git, allowed: destinationAllowed})
+	if err != nil {
+		t.Fatalf("merge with separate graphs: %v", err)
+	}
+	if merged.Epoch != next.Epoch {
+		t.Errorf("merged epoch = %#v, want %#v", merged.Epoch, next.Epoch)
+	}
+}
+
 // TestMergeAcceptsClosingAFinishedTrack checks the one removal that is not a
 // loss.
 //

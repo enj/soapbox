@@ -41,6 +41,9 @@ type Report struct {
 	// carrying the directness the go command settled on rather than the one the
 	// source module had.
 	Kept []gomodmap.Requirement
+	// Added lists transitive requirements introduced by an explicitly allowed
+	// compatibility re-tidy, sorted by path.
+	Added []gomodmap.Requirement
 	// Dropped lists the module paths tidying removed because nothing in the
 	// extracted sources imports them, sorted. A large Dropped set is the normal
 	// outcome of extracting a few packages out of Kubernetes rather than a
@@ -77,6 +80,10 @@ type VerifyOptions struct {
 	Dir string
 	// GoMod is the generated module file to install.
 	GoMod []byte
+	// AllowAdditions permits tidy to add transitive requirements after a
+	// compatibility transform deliberately removed a staging module whose go.mod
+	// had supplied them. Added versions are recorded rather than hidden.
+	AllowAdditions bool
 }
 
 // Verify installs the generated go.mod in a scratch module, tidies it, and
@@ -181,9 +188,14 @@ func Verify(ctx context.Context, runner *gocli.Runner, opts VerifyOptions) (repo
 	if err != nil {
 		return nil, fmt.Errorf("verify generated module: tidied go.mod: %w", err)
 	}
-	report, err = compare(intended, actual)
+	report, err = compare(intended, actual, opts.AllowAdditions)
 	if err != nil {
 		return nil, fmt.Errorf("verify generated module: %w", err)
+	}
+	if opts.AllowAdditions {
+		if err := scoped.Tidy(ctx, gocli.TidyOptions{Diff: true}); err != nil {
+			return nil, fmt.Errorf("verify generated module: compatibility tidy is not stable: %w", err)
+		}
 	}
 
 	sum, err := os.ReadFile(filepath.Join(opts.Dir, goSumName))
@@ -255,7 +267,7 @@ func removeGenerated(dir string) error {
 }
 
 // compare checks the tidied module against the generated one.
-func compare(intended, actual *modfile.File) (*Report, error) {
+func compare(intended, actual *modfile.File, allowAdditions bool) (*Report, error) {
 	if err := compareDirectives(intended, actual); err != nil {
 		return nil, err
 	}
@@ -274,9 +286,14 @@ func compare(intended, actual *modfile.File) (*Report, error) {
 		want, wasPinned := pinned[modulePath]
 		switch {
 		case !wasPinned:
-			// The source module lists every module its build resolves, so a
-			// requirement the engine never wrote cannot have come from the source
-			// commit being extracted.
+			requirement := gomodmap.Requirement{Path: modulePath, Version: version, Indirect: require.Indirect}
+			if allowAdditions {
+				report.Kept = append(report.Kept, requirement)
+				report.Added = append(report.Added, requirement)
+				continue
+			}
+			// Ordinarily the source module lists every module its build resolves.
+			// A compatibility transform is the explicit exception handled above.
 			added = append(added, fmt.Sprintf("%s %s", modulePath, version))
 			continue
 		case version != want.Mod.Version:
@@ -310,6 +327,7 @@ func compare(intended, actual *modfile.File) (*Report, error) {
 	slices.Sort(added)
 	slices.Sort(report.Dropped)
 	slices.SortFunc(report.Kept, func(a, b gomodmap.Requirement) int { return cmp.Compare(a.Path, b.Path) })
+	slices.SortFunc(report.Added, func(a, b gomodmap.Requirement) int { return cmp.Compare(a.Path, b.Path) })
 	slices.SortFunc(report.Reclassified, func(a, b Reclassification) int { return cmp.Compare(a.Path, b.Path) })
 
 	if len(floated) > 0 {

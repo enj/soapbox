@@ -6,16 +6,40 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/enj/soapbox/tools/internal/actionsctx"
 	"github.com/enj/soapbox/tools/internal/config"
 	"github.com/enj/soapbox/tools/internal/generate"
+	"github.com/enj/soapbox/tools/internal/ghapi"
 	"github.com/enj/soapbox/tools/internal/gitcli"
 	"github.com/enj/soapbox/tools/internal/gocli"
+	"github.com/enj/soapbox/tools/internal/publish"
+	"github.com/enj/soapbox/tools/internal/source"
 	"github.com/enj/soapbox/tools/internal/sync"
 )
+
+// Fixed workflow environment names. The token is the publishing credential;
+// the approval is an optional reviewed manifest hash for manual mode and never a
+// credential.
+const (
+	tokenEnvName    = "SOAPBOX_GITHUB_TOKEN"
+	approvalEnvName = "SOAPBOX_APPROVAL"
+)
+
+// syncWorkflowFile is the workflow file name the engine checks for being
+// enabled. It matches the file setup generates.
+const syncWorkflowFile = "sync.yml"
+
+// syncWorkflowPath is the repository-relative path GitHub reports for the sync
+// workflow. It must match what setup generates; a mismatch means the repository
+// contains a different workflow at the same file name, which the engine must
+// refuse rather than trust.
+const syncWorkflowPath = ".github/workflows/" + syncWorkflowFile
 
 // syncFlags holds the parsed sync flags.
 //
@@ -33,6 +57,7 @@ type syncFlags struct {
 	stateCommit *string
 	apply       *bool
 	approve     *string
+	unattended  *bool
 }
 
 func syncFlagSet() (*flag.FlagSet, *syncFlags) {
@@ -57,6 +82,7 @@ func syncFlagSet() (*flag.FlagSet, *syncFlags) {
 		stateCommit: fs.String("state-commit", "", "previous state record to resume from, empty for a destination that holds none"),
 		apply:       fs.Bool("apply", false, "publish the plan, which requires -approve and a reachable destination"),
 		approve:     fs.String("approve", "", "the manifest hash being approved, required by -apply"),
+		unattended:  fs.Bool("unattended", false, "run as a trusted workflow, reading "+tokenEnvName+" and self-approving"),
 	}
 }
 
@@ -96,6 +122,15 @@ func runSync(ctx context.Context, env Env, args []string) error {
 	if err != nil {
 		return profileError(env, paths.config, err)
 	}
+
+	// Unattended mode requires automatic publication.
+	if *flags.unattended && cfg.Publication.Mode != config.PublicationModeAutomatic {
+		return &usageError{
+			err:   fmt.Errorf("-unattended requires publication.mode %q, profile has %q", config.PublicationModeAutomatic, cfg.Publication.Mode),
+			usage: usage,
+		}
+	}
+
 	ref, err := selectedRef(flags.runFlags, cfg)
 	if err != nil {
 		return &usageError{err: err, usage: usage}
@@ -103,6 +138,29 @@ func runSync(ctx context.Context, env Env, args []string) error {
 	patchBranch, err := selectedPatchBranch(flags.runFlags, cfg, ref)
 	if err != nil {
 		return &usageError{err: err, usage: usage}
+	}
+
+	// Read the token and validate the workflow context. The token is read
+	// exactly once, before any subprocess or network call, so no code path
+	// can observe it from two call sites. os.LookupEnv is the production
+	// lookup; tests pass a static map instead.
+	token, actionsCtx, err := syncToken(flags, cfg, usage, os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	workflowApply := *flags.apply
+	workflowApproval := *flags.approve
+	if actionsCtx != nil && !*flags.unattended {
+		approval, ok := os.LookupEnv(approvalEnvName)
+		if ok && approval != "" {
+			if workflowApply && workflowApproval != approval {
+				return &usageError{err: errors.New("the command-line approval and workflow approval differ"), usage: usage}
+			}
+			if err := validateWorkflowApproval(approval); err != nil {
+				return &usageError{err: err, usage: usage}
+			}
+			workflowApply, workflowApproval = true, approval
+		}
 	}
 
 	// The source runner is anonymous, exactly as a generation's is: reading
@@ -113,34 +171,128 @@ func runSync(ctx context.Context, env Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	destinationGit, err := gitcli.New(ctx, gitcli.Options{Dir: destination, Inherit: []string{"PATH"}})
+
+	// When the Actions context was validated, compare GITHUB_SHA to the
+	// destination repository HEAD before any credential is built. The check
+	// uses an anonymous runner with lazy-fetch disabled so a partial or
+	// promisor checkout cannot reach any remote and expose a token that does
+	// not exist yet in this runner.
+	//
+	// The same runner verifies that the profile directory and the destination
+	// are the same repository checkout, so -dir cannot supply one profile
+	// while the token-bearing destination runner operates on another.
+	var localDestinationGit *gitcli.Runner
+	if actionsCtx != nil {
+		if err := checkWorkflowSyncFlags(given); err != nil {
+			return &usageError{err: err, usage: usage}
+		}
+		anonDest, anonErr := gitcli.New(ctx, gitcli.Options{Dir: destination, Inherit: []string{"PATH"}})
+		if anonErr != nil {
+			return anonErr
+		}
+		localDestinationGit = anonDest.WithNoLazyFetch()
+		if err := verifySyncSHA(ctx, localDestinationGit, actionsCtx.SHA); err != nil {
+			return err
+		}
+		if err := verifySyncCheckout(ctx, localDestinationGit, paths.dir); err != nil {
+			return err
+		}
+	}
+
+	// Build the destination runner. When a token is present it carries the
+	// credential; otherwise it is anonymous and only local operations work.
+	destOpts := gitcli.Options{Dir: destination, Inherit: []string{"PATH"}}
+	if token != "" {
+		cred, credErr := gitcli.NewGitHubTokenCredential(token)
+		if credErr != nil {
+			return fmt.Errorf("build destination credential: %w", credErr)
+		}
+		destOpts, err = cred.Apply(destOpts)
+		if err != nil {
+			return fmt.Errorf("apply destination credential: %w", err)
+		}
+	}
+	destinationGit, err := gitcli.New(ctx, destOpts)
 	if err != nil {
 		return err
 	}
+
 	goRunner, err := generateGoRunner(ctx, paths.dir, proxy)
 	if err != nil {
 		return err
 	}
 
-	result, err := sync.Plan(ctx, sync.Options{
-		Generate: generate.Options{
-			Config:       cfg,
-			ProfileDir:   paths.dir,
-			CacheRoot:    paths.cache,
-			WorkRoot:     paths.work,
-			OutputRoot:   paths.out,
-			StorePath:    paths.store,
-			Ref:          ref,
-			PatchBranch:  patchBranch,
-			SourceRemote: *flags.sourceRemote,
-			Fetch:        *flags.fetch && !*flags.offline,
-			Offline:      *flags.offline,
-			Materialize:  *flags.materialize,
-			KeepWorktree: *flags.keepWorktree,
-			Strict:       *flags.strict,
+	// Build the LookupEnv that hides the token from generate and extract.
+	// The nested generation must never see the publishing credential.
+	hiddenLookup := syncLookupEnv(os.LookupEnv)
+	generateOpts := generate.Options{
+		Config:       cfg,
+		ProfileDir:   paths.dir,
+		CacheRoot:    paths.cache,
+		WorkRoot:     paths.work,
+		OutputRoot:   paths.out,
+		StorePath:    paths.store,
+		Ref:          ref,
+		PatchBranch:  patchBranch,
+		SourceRemote: *flags.sourceRemote,
+		Fetch:        *flags.fetch && !*flags.offline,
+		Offline:      *flags.offline,
+		Materialize:  *flags.materialize,
+		KeepWorktree: *flags.keepWorktree,
+		Strict:       *flags.strict,
+		Git:          sourceGit,
+		Go:           goRunner,
+		LookupEnv:    hiddenLookup,
+	}
+
+	if actionsCtx != nil {
+		if *flags.unattended {
+			if err := verifySyncWorkflow(ctx, token, cfg); err != nil {
+				return err
+			}
+		}
+		cache, err := source.Open(ctx, source.Options{
+			Remote: cfg.Source.Repository, CacheRoot: paths.cache,
+			WorktreeRoot: filepath.Join(paths.work, "reconcile-source-worktrees"),
 			Git:          sourceGit,
-			Go:           goRunner,
-		},
+		})
+		if err != nil {
+			return syncError(err, usage)
+		}
+		dest := sync.Destination{
+			Git: destinationGit, Remote: cfg.Destination.Remote,
+			Identity: "github.com/" + cfg.Destination.Repository,
+			Lister:   publish.NewHTTPSRemote(destinationGit),
+		}
+		budget := sync.WorkflowBudget{}
+		if *flags.unattended {
+			budget = sync.WorkflowBudget{
+				Deadline: time.Now().Add(165 * time.Minute),
+				Reserve:  10 * time.Minute,
+			}
+		}
+		reconciled, err := sync.Reconcile(ctx, sync.ReconcileOptions{
+			Config: cfg, SourceCache: cache,
+			LocalGit: localDestinationGit, RemoteGit: destinationGit,
+			Destination: dest, Generate: generateOpts,
+			Apply: workflowApply, Approval: workflowApproval,
+			Automatic: *flags.unattended, Budget: budget,
+		})
+		if err != nil {
+			return syncError(err, usage)
+		}
+		if err := writeReportOutput(ctx, env, "sync", paths.report, *flags.format,
+			reconciled.JSON, reconciled.Text); err != nil {
+			return err
+		}
+		if reconciled.NeedsConfiguration {
+			return syncError(errors.New("reconciliation requires the resolved source anchor to be persisted in the profile"), usage)
+		}
+		return nil
+	}
+
+	result, err := sync.Plan(ctx, sync.Options{
+		Generate: generateOpts,
 		Destination: sync.Destination{
 			Git:              destinationGit,
 			Remote:           syncRemote(flags, cfg),
@@ -157,6 +309,7 @@ func runSync(ctx context.Context, env Env, args []string) error {
 		result.Manifest.JSON, result.Manifest.Text); err != nil {
 		return err
 	}
+
 	if !*flags.apply {
 		return nil
 	}
@@ -196,12 +349,266 @@ func checkSyncFlags(flags *syncFlags, given map[string]bool) error {
 	if *flags.destination == "" {
 		return errors.New("a synchronization writes its objects into a destination repository, so -destination is required")
 	}
+
+	// Unattended mode is mutually exclusive with manual apply/approve,
+	// local-remote, remote/identity overrides, state-commit, tag, and
+	// source-remote. These are contradictions in intent: unattended self-
+	// approves, pushes over HTTPS, and derives every parameter from the
+	// profile and the Actions context. A manual override alongside it is
+	// either a mistake or an attempt to change what the trusted workflow
+	// publishes, both of which the engine must refuse.
+	if *flags.unattended {
+		switch {
+		case *flags.apply:
+			return errors.New("-unattended self-approves, so -apply cannot also be given")
+		case *flags.approve != "":
+			return errors.New("-unattended self-approves, so -approve cannot also be given")
+		case *flags.localRemote:
+			return errors.New("-unattended publishes over HTTPS, so -local-remote cannot also be given")
+		case given["remote"]:
+			return errors.New("-unattended derives the remote from the profile, so -remote cannot also be given")
+		case given["identity"]:
+			return errors.New("-unattended derives the identity from the profile, so -identity cannot also be given")
+		case given["state-commit"]:
+			return errors.New("-unattended discovers state from the destination, so -state-commit cannot also be given")
+		case given["tag"]:
+			return errors.New("-unattended discovers releases from the source, so -tag cannot also be given")
+		case given["source-remote"]:
+			return errors.New("-unattended derives the source from the profile, so -source-remote cannot also be given")
+		}
+		return nil
+	}
+
 	switch {
 	case *flags.apply && *flags.approve == "":
 		return errors.New("-apply publishes, so the manifest hash being approved must be given with -approve")
 	case !*flags.apply && *flags.approve != "":
 		return errors.New("-approve names a manifest to publish, so -apply must also be given")
 	}
+	return nil
+}
+
+// syncToken reads the publishing credential and validates the Actions context.
+//
+// The credential is read in exactly one place and returned as a plain string,
+// which the caller puts into exactly two typed holders (GitHubTokenCredential
+// and StaticBearer) and never formats again. Every code path that uses the
+// token is downstream from this function.
+//
+// The invariant is: Actions context is validated before the token is read.
+// In unattended mode, Validate runs first and only then is the token looked
+// up. In manual mode with a token present, the token's existence is detected
+// but its value is not returned until Validate has passed. When neither
+// unattended nor a token is set, the function returns empty and no credential
+// is wired.
+//
+// The returned Context is non-nil when validation ran, regardless of mode; the
+// caller uses it to compare GITHUB_SHA to the destination HEAD.
+//
+// The lookup parameter is the environment reader. Production passes
+// os.LookupEnv; tests pass a static map.
+func checkWorkflowSyncFlags(given map[string]bool) error {
+	for _, flag := range []string{
+		"local-remote", "remote", "identity",
+		"state-commit", "tag", "branch", "source-remote", "patch-branch",
+		"offline", "fetch",
+	} {
+		if given[flag] {
+			return fmt.Errorf("trusted workflow reconciliation derives its inputs, so -%s cannot be given", flag)
+		}
+	}
+	return nil
+}
+
+func validateWorkflowApproval(approval string) error {
+	const prefix = "sha256:"
+	if len(approval) != len(prefix)+64 || !strings.HasPrefix(approval, prefix) {
+		return fmt.Errorf("%s must be sha256: followed by 64 lowercase hexadecimal characters", approvalEnvName)
+	}
+	for _, r := range approval[len(prefix):] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return fmt.Errorf("%s must be sha256: followed by 64 lowercase hexadecimal characters", approvalEnvName)
+		}
+	}
+	return nil
+}
+
+func syncToken(flags *syncFlags, cfg *config.Config, usage func(io.Writer), lookup actionsctx.LookupEnv) (string, *actionsctx.Context, error) {
+	if *flags.unattended {
+		// Validate the Actions context before reading the token.
+		actionsCtx, err := actionsctx.Validate(actionsctx.Options{
+			LookupEnv:     lookup,
+			Repository:    cfg.Destination.Repository,
+			DefaultBranch: cfg.Destination.Branch,
+		})
+		if err != nil {
+			return "", nil, fmt.Errorf("workflow context: %w", err)
+		}
+
+		token, ok := lookup(tokenEnvName)
+		if !ok || token == "" {
+			return "", nil, &usageError{
+				err:   fmt.Errorf("-unattended requires %s to be set", tokenEnvName),
+				usage: usage,
+			}
+		}
+		return token, actionsCtx, nil
+	}
+
+	// Non-unattended: detect whether the token is present. If it is,
+	// validate the Actions context before returning the value.
+	token, haveToken := lookup(tokenEnvName)
+	if haveToken && token == "" {
+		haveToken = false
+	}
+	if !haveToken {
+		return "", nil, nil
+	}
+
+	actionsCtx, err := actionsctx.Validate(actionsctx.Options{
+		LookupEnv:     lookup,
+		Repository:    cfg.Destination.Repository,
+		DefaultBranch: cfg.Destination.Branch,
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("workflow context: %w", err)
+	}
+
+	return token, actionsCtx, nil
+}
+
+// verifySyncSHA checks that the validated GITHUB_SHA matches the destination
+// repository HEAD. A mismatch means the checkout drifted from what Actions
+// recorded, which could mean the workflow is running against stale code.
+func verifySyncSHA(ctx context.Context, destGit *gitcli.Runner, expectedSHA string) error {
+	head, err := destGit.ResolveCommit(ctx, "HEAD")
+	if err != nil {
+		return fmt.Errorf("verify destination HEAD: %w", err)
+	}
+	if head != expectedSHA {
+		return fmt.Errorf("destination HEAD %s does not match GITHUB_SHA %s", head, expectedSHA)
+	}
+	return nil
+}
+
+// verifySyncCheckout verifies that the destination repository and the profile
+// directory belong to the same Git repository. Without this check, -dir could
+// supply a profile from a nested repository (such as a submodule or an
+// independently initialized subdirectory) while the token-bearing destination
+// runner operates on the outer checkout, which would let a crafted profile
+// control what the credential publishes.
+//
+// Both roots are discovered by asking Git for the work tree root from each
+// directory, then resolved through symlinks and compared for exact equality.
+// A containment check alone is insufficient because a nested Git repository
+// inside the destination path would pass it.
+func verifySyncCheckout(ctx context.Context, destGit *gitcli.Runner, profileDir string) error {
+	destRoot, err := destGit.RepositoryRoot(ctx)
+	if err != nil {
+		return fmt.Errorf("verify checkout: destination: %w", err)
+	}
+
+	profileGit, err := gitcli.New(ctx, gitcli.Options{Dir: profileDir, Inherit: []string{"PATH"}})
+	if err != nil {
+		return fmt.Errorf("verify checkout: profile runner: %w", err)
+	}
+	profileRoot, err := profileGit.WithNoLazyFetch().RepositoryRoot(ctx)
+	if err != nil {
+		return fmt.Errorf("verify checkout: profile: %w", err)
+	}
+
+	destResolved, err := filepath.EvalSymlinks(destRoot)
+	if err != nil {
+		return fmt.Errorf("verify checkout: resolve destination root: %w", err)
+	}
+	profileResolved, err := filepath.EvalSymlinks(profileRoot)
+	if err != nil {
+		return fmt.Errorf("verify checkout: resolve profile root: %w", err)
+	}
+
+	if destResolved != profileResolved {
+		return fmt.Errorf("profile repository root %s does not match destination repository root %s", profileResolved, destResolved)
+	}
+	return nil
+}
+
+// syncLookupEnv builds the environment lookup the nested generation uses.
+//
+// The wrapper always hides the token environment variable, even when no token
+// was present at the time of the call. A nil return would let generate fall
+// back to os.LookupEnv, and an environment mutation between this point and
+// the generation's own checkCredentialEnvironment would expose the token to
+// subprocess inheritance. Returning a wrapper that unconditionally blocks the
+// name closes that window.
+//
+// The base parameter is the same lookup the caller used; production passes
+// os.LookupEnv, tests pass a static map.
+func syncLookupEnv(base actionsctx.LookupEnv) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		if name == tokenEnvName || name == approvalEnvName {
+			return "", false
+		}
+		return base(name)
+	}
+}
+
+// verifySyncWorkflow checks the remote repository state before an unattended
+// publication proceeds.
+//
+// It builds a ghapi client from the same token the publication uses and
+// delegates to verifySyncWorkflowWithClient.
+func verifySyncWorkflow(ctx context.Context, token string, cfg *config.Config) error {
+	auth, err := ghapi.NewStaticBearer(token)
+	if err != nil {
+		return fmt.Errorf("workflow verification: %w", err)
+	}
+	client, err := ghapi.New(ghapi.Config{Authorizer: auth})
+	if err != nil {
+		return fmt.Errorf("workflow verification: %w", err)
+	}
+	return verifySyncWorkflowWithClient(ctx, client, cfg)
+}
+
+// verifySyncWorkflowWithClient checks three properties of the destination
+// repository before an unattended publication:
+//
+//  1. The repository's default branch matches the profile, so a renamed
+//     default branch fails closed rather than pushing to a branch the
+//     repository no longer treats as default.
+//  2. The sync workflow is enabled. GitHub disables scheduled workflows after
+//     60 days of inactivity, and a disabled workflow fails silently by never
+//     running, so each unattended run confirms it is still active.
+//  3. The workflow path matches the expected path, so a workflow at the same
+//     file name but a different location is refused.
+//
+// It is separated from verifySyncWorkflow so tests can inject an httptest-
+// backed client without constructing a real token.
+func verifySyncWorkflowWithClient(ctx context.Context, client *ghapi.Client, cfg *config.Config) error {
+	owner, repo, ok := strings.Cut(cfg.Destination.Repository, "/")
+	if !ok {
+		return fmt.Errorf("workflow verification: destination repository %q is not owner/name", cfg.Destination.Repository)
+	}
+
+	defaultBranch, err := client.DefaultBranch(ctx, owner, repo)
+	if err != nil {
+		return fmt.Errorf("workflow verification: %w", err)
+	}
+	if defaultBranch != cfg.Destination.Branch {
+		return fmt.Errorf("workflow verification: repository default branch %q does not match profile %q",
+			defaultBranch, cfg.Destination.Branch)
+	}
+
+	workflow, err := client.Workflow(ctx, owner, repo, syncWorkflowFile)
+	if err != nil {
+		return fmt.Errorf("workflow verification: %w", err)
+	}
+	if !workflow.Enabled() {
+		return fmt.Errorf("workflow verification: %s is %s, not %s", syncWorkflowFile, workflow.State, ghapi.WorkflowActive)
+	}
+	if workflow.Path != syncWorkflowPath {
+		return fmt.Errorf("workflow verification: workflow path %q does not match expected %q", workflow.Path, syncWorkflowPath)
+	}
+
 	return nil
 }
 

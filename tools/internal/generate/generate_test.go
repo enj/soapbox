@@ -106,14 +106,50 @@ func TestGenerateRefusesUnusableOptions(t *testing.T) {
 			mutate: func(_ *testing.T, opts *generate.Options) {
 				opts.Ref = extract.Ref{Kind: extract.RefBranch, Name: "master"}
 			},
-			wantErr: "only a release tag can be generated from",
+			wantErr: "only a release tag or an engine-selected exact commit can be generated",
 		},
 		{
 			name: "unknown ref kind",
 			mutate: func(_ *testing.T, opts *generate.Options) {
-				opts.Ref = extract.Ref{Kind: "commit", Name: "abc"}
+				opts.Ref = extract.Ref{Kind: "snapshot", Name: "abc"}
 			},
-			wantErr: `ref kind "commit" must be tag`,
+			wantErr: `ref kind "snapshot" must be tag or commit`,
+		},
+		{
+			name: "malformed exact commit",
+			mutate: func(_ *testing.T, opts *generate.Options) {
+				opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: "abc"}
+				opts.Fetch = false
+			},
+			wantErr: "exact source commit",
+		},
+		{
+			name: "exact commit without release context",
+			mutate: func(_ *testing.T, opts *generate.Options) {
+				opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: strings.Repeat("a", 40)}
+				opts.Fetch = false
+			},
+			wantErr: "requires its bounding release context",
+		},
+		{
+			name: "exact commit without history anchor",
+			mutate: func(_ *testing.T, opts *generate.Options) {
+				opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: strings.Repeat("a", 40)}
+				opts.ReleaseContext = "v1.36.1"
+				opts.Fetch = false
+			},
+			wantErr: "requires its published history anchor",
+		},
+		{
+			name: "exact commit fetch",
+			mutate: func(_ *testing.T, opts *generate.Options) {
+				opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: strings.Repeat("a", 40)}
+				opts.ReleaseContext = "v1.36.1"
+				opts.HistoryAnchor = strings.Repeat("a", 40)
+				opts.HistoryAnchorRelease = "v1.36.1"
+				opts.Fetch = true
+			},
+			wantErr: "cannot be fetched by object name",
 		},
 		{
 			name: "no ref name",
@@ -126,13 +162,13 @@ func TestGenerateRefusesUnusableOptions(t *testing.T) {
 			name: "publishing credential in the environment",
 			mutate: func(_ *testing.T, opts *generate.Options) {
 				opts.LookupEnv = func(name string) (string, bool) {
-					if name == "SOAPBOX_TEST_GITHUB_APP_PRIVATE_KEY" {
-						return "-----BEGIN PRIVATE KEY-----", true
+					if name == "SOAPBOX_GITHUB_TOKEN" {
+						return "fake-credential-for-test", true
 					}
 					return "", false
 				}
 			},
-			wantErr: "SOAPBOX_TEST_GITHUB_APP_PRIVATE_KEY is set",
+			wantErr: "SOAPBOX_GITHUB_TOKEN is set",
 		},
 	}
 

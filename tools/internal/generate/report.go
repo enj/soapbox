@@ -89,8 +89,8 @@ type SourceReport struct {
 	RefName string `json:"refName"`
 	// Commit is the upstream commit both extraction passes read.
 	Commit string `json:"commit"`
-	// ReleaseTag is the generated module's tag for this upstream release, which
-	// is what the release policy maps the upstream tag onto.
+	// ReleaseTag is the generated module's tag for an upstream release. It is
+	// empty for an intermediate exact commit, which publishes no module tag.
 	ReleaseTag string `json:"releaseTag"`
 	// Fetched, Offline, and RemoteOverridden report how the source was obtained.
 	Fetched          bool `json:"fetched"`
@@ -169,6 +169,9 @@ type ModuleReport struct {
 	GoSumHash string `json:"goSumHash"`
 	// Kept lists the requirements that survived tidying, sorted by path.
 	Kept []RequirementReport `json:"kept"`
+	// Added lists transitive requirements introduced by an allowed compatibility
+	// re-tidy, sorted by path.
+	Added []RequirementReport `json:"added,omitempty"`
 	// Dropped lists the module paths tidying removed, sorted. A large set is the
 	// normal outcome of extracting a few packages out of Kubernetes.
 	Dropped []string `json:"dropped"`
@@ -548,10 +551,25 @@ func (r *Report) recordStaging(root *gomodmap.RootModule, staging []gomodmap.Mod
 
 // recordModule summarizes the verified module metadata.
 func (r *Report) recordModule(post, pre *modgen.Report) {
+	report := renderModuleReport(post)
+	report.BaselineGoModHash = contentDigest(pre.GoMod)
+	r.Module = report
+}
+
+// refreshModule replaces the generated-module facts after an approved copy
+// changes the tidied module while retaining the pre-prune baseline identity.
+func (r *Report) refreshModule(post *modgen.Report) {
+	baseline := r.Module.BaselineGoModHash
+	r.Module = renderModuleReport(post)
+	r.Module.BaselineGoModHash = baseline
+}
+
+// renderModuleReport converts the toolchain report without inventing a second
+// source of truth for requirement ordering or directness.
+func renderModuleReport(post *modgen.Report) ModuleReport {
 	report := ModuleReport{
-		GoModHash:         contentDigest(post.GoMod),
-		Dropped:           slices.Clone(post.Dropped),
-		BaselineGoModHash: contentDigest(pre.GoMod),
+		GoModHash: contentDigest(post.GoMod),
+		Dropped:   slices.Clone(post.Dropped),
 	}
 	if len(post.GoSum) > 0 {
 		report.GoSumHash = contentDigest(post.GoSum)
@@ -563,6 +581,11 @@ func (r *Report) recordModule(post, pre *modgen.Report) {
 			Indirect: requirement.Indirect,
 		})
 	}
+	for _, requirement := range post.Added {
+		report.Added = append(report.Added, RequirementReport{
+			Path: requirement.Path, Version: requirement.Version, Indirect: requirement.Indirect,
+		})
+	}
 	for _, reclassified := range post.Reclassified {
 		report.Reclassified = append(report.Reclassified, ReclassificationReport{
 			Path:     reclassified.Path,
@@ -570,9 +593,10 @@ func (r *Report) recordModule(post, pre *modgen.Report) {
 		})
 	}
 	slices.SortFunc(report.Kept, func(a, b RequirementReport) int { return cmpString(a.Path, b.Path) })
+	slices.SortFunc(report.Added, func(a, b RequirementReport) int { return cmpString(a.Path, b.Path) })
 	slices.SortFunc(report.Reclassified, func(a, b ReclassificationReport) int { return cmpString(a.Path, b.Path) })
 	slices.Sort(report.Dropped)
-	r.Module = report
+	return report
 }
 
 // recordFacade summarizes both manifests and the comparison between them.
@@ -816,8 +840,8 @@ func (r *Result) Summary() string {
 	fmt.Fprintf(&b, "  profile       %s\n", report.Engine.ProfileHash)
 	fmt.Fprintf(&b, "  module        %s\n", report.Output.Module)
 	fmt.Fprintf(&b, "  staging       %d modules pinned%s\n", len(report.Staging.Modules), cachedSuffix(report.Staging.Cached))
-	fmt.Fprintf(&b, "  requirements  %d kept, %d dropped, %d reclassified\n",
-		len(report.Module.Kept), len(report.Module.Dropped), len(report.Module.Reclassified))
+	fmt.Fprintf(&b, "  requirements  %d kept, %d added, %d dropped, %d reclassified\n",
+		len(report.Module.Kept), len(report.Module.Added), len(report.Module.Dropped), len(report.Module.Reclassified))
 	fmt.Fprintf(&b, "  facade        %d entries, %d differences from the unpruned baseline\n",
 		len(report.Facade.Entries), len(report.Facade.Differences))
 	fmt.Fprintf(&b, "  dependencies  %s, %d candidates, %d copied\n",

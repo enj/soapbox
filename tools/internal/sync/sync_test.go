@@ -369,3 +369,86 @@ func TestPlanRefusesARunShapeItCannotPublish(t *testing.T) {
 		})
 	}
 }
+
+// TestProjectRecordsBranchAndTagThenFixedPoint proves that after publication,
+// a second synchronization records both the branch and the tag in Published,
+// and a third synchronization with the same state is a fixed-point no-op
+// (digest unchanged, state commit reused).
+func TestProjectRecordsBranchAndTagThenFixedPoint(t *testing.T) {
+	ctx := t.Context()
+	dest := newDestination(ctx, t)
+
+	// First sync: no published refs yet.
+	first, err := sync.Project(ctx, dest.options())
+	if err != nil {
+		t.Fatalf("first project: %v", err)
+	}
+
+	// The first sync records no Published entries because the destination was
+	// empty when it was read.
+	if len(first.Document.Published) != 0 {
+		t.Errorf("first sync published = %d entries, want 0", len(first.Document.Published))
+	}
+
+	// Simulate publication: push the consumer branch, tag, and state.
+	head := first.Replay.Heads[0].Destination
+	tagRef := "refs/tags/" + first.Release.Tag
+	if err := dest.git.PushAtomic(ctx, dest.remote, []gitcli.PushUpdate{
+		{Ref: testBranchRef, New: head, ExpectAbsent: true},
+		{Ref: tagRef, New: first.Release.Object, ExpectAbsent: true},
+		{Ref: testStateRef, New: first.State.Commit, ExpectAbsent: true},
+	}); err != nil {
+		t.Fatalf("simulate first publication: %v", err)
+	}
+	if err := dest.git.UpdateRef(ctx, testBranchRef, head, dest.parent); err != nil {
+		t.Fatalf("advance local branch: %v", err)
+	}
+
+	// Second sync: sees the published branch and tag.
+	opts := dest.options()
+	opts.StateCommit = first.State.Commit
+	second, err := sync.Project(ctx, opts)
+	if err != nil {
+		t.Fatalf("second project: %v", err)
+	}
+
+	// The second sync records both branch and tag in Published.
+	wantKinds := map[string]bool{testBranchRef: false, tagRef: false}
+	for _, pub := range second.Document.Published {
+		if _, expected := wantKinds[pub.Ref]; expected {
+			wantKinds[pub.Ref] = true
+		}
+	}
+	for ref, found := range wantKinds {
+		if !found {
+			t.Errorf("second sync did not record Published entry for %s", ref)
+		}
+	}
+
+	// Simulate publication of the second state.
+	if err := dest.git.PushAtomic(ctx, dest.remote, []gitcli.PushUpdate{
+		{Ref: testStateRef, New: second.State.Commit, ExpectedOld: first.State.Commit},
+	}); err != nil {
+		t.Fatalf("simulate second publication: %v", err)
+	}
+
+	// Third sync: same destination, same release — fixed-point no-op.
+	opts = dest.options()
+	opts.StateCommit = second.State.Commit
+	third, err := sync.Project(ctx, opts)
+	if err != nil {
+		t.Fatalf("third project: %v", err)
+	}
+
+	// The digest is unchanged: the third run sees the same Published entries
+	// the second recorded.
+	if second.Document.Digest != third.Document.Digest {
+		t.Errorf("digest changed between second and third run: %s vs %s",
+			second.Document.Digest, third.Document.Digest)
+	}
+	// The state commit is reused rather than rewritten.
+	if second.State.Commit != third.State.Commit {
+		t.Errorf("state commit changed between second and third run: %s vs %s",
+			second.State.Commit, third.State.Commit)
+	}
+}

@@ -63,8 +63,8 @@ type Options struct {
 	// replaces it in place, so this is both the input and the output tree.
 	Root string
 	// Config is the validated profile the template carries. Setup reads the
-	// destination module, the branch, and the App secret names from it, and never
-	// edits it.
+	// destination module, the branch, and the publication mode from it, and
+	// never edits it.
 	Config *config.Config
 	// EngineVersion is the immutable engine release the nested tools module pins.
 	// Both spellings of one release are accepted, "v1.2.3" and the repository tag

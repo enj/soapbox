@@ -2,7 +2,7 @@
 // no ref points at.
 //
 // A backfill of tens of thousands of upstream commits does not finish in one
-// process. It stops, on a timeout, on an expiring installation token, or on a
+// process. It stops, on a timeout, on a token expiry, or on a
 // chunk boundary it was asked to stop at, and the next process has to know
 // exactly where the last one got to. That knowledge cannot live in a file on a
 // runner that is destroyed between jobs, so it lives in the destination
@@ -530,6 +530,16 @@ func (d Document) images() []image {
 		claims = append(claims, image{track.Source, track.Destination, "track " + track.Name})
 	}
 	for _, entry := range d.Published {
+		// A tag's Object is an annotated tag object, not the commit the source
+		// became. Including it would assert that one source commit maps to both
+		// a branch commit and a tag object, which is a correspondence conflict
+		// by construction. Tags are excluded from the source-to-destination
+		// correspondence check; their immutability is enforced separately by
+		// Merge (which refuses any change to a tag's Object or Source) and by
+		// the publication plan (which refuses a tag that moved on the remote).
+		if entry.Kind == KindTag {
+			continue
+		}
 		claims = append(claims, image{entry.Source, entry.Object, "published " + entry.Ref})
 	}
 	return claims
@@ -562,6 +572,30 @@ func (d Document) validateCorrespondence() error {
 		forward[claim.source] = claim
 		backward[claim.became] = claim
 	}
+
+	// Separate tag-only correspondence: two tags must not share one source or
+	// one object. Tags are excluded from the branch correspondence above because
+	// a tag object is not the commit the source became, but they still must be
+	// one-to-one among themselves.
+	tagForward := make(map[string]image)
+	tagBackward := make(map[string]image)
+	for _, entry := range d.Published {
+		if entry.Kind != KindTag {
+			continue
+		}
+		claim := image{entry.Source, entry.Object, "published tag " + entry.Ref}
+		if seen, ok := tagForward[claim.source]; ok && seen.became != claim.became {
+			return fmt.Errorf("%w: %s says source %s became %s, %s says it became %s",
+				ErrCorrespondence, seen.label, claim.source, seen.became, claim.label, claim.became)
+		}
+		if seen, ok := tagBackward[claim.became]; ok && seen.source != claim.source {
+			return fmt.Errorf("%w: %s says %s came from %s, %s says it came from %s",
+				ErrCorrespondence, seen.label, claim.became, seen.source, claim.label, claim.source)
+		}
+		tagForward[claim.source] = claim
+		tagBackward[claim.became] = claim
+	}
+
 	return nil
 }
 

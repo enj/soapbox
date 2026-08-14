@@ -20,11 +20,8 @@ func TestProfileBytesExcludesOperationalFields(t *testing.T) {
 			mutations: []mutation{{old: "chunkSize: 200", new: "chunkSize: 25"}},
 		},
 		{
-			name: "github app environment names",
-			mutations: []mutation{
-				{old: "appIDEnv: SOAPBOX_GITHUB_APP_ID", new: "appIDEnv: OTHER_APP_ID"},
-				{old: "apiBaseURL: https://api.github.com", new: "apiBaseURL: https://api.github.com/"},
-			},
+			name:      "publication mode",
+			mutations: []mutation{{old: "mode: manual", new: "mode: automatic"}},
 		},
 		{
 			name: "vanity location",
@@ -120,6 +117,8 @@ func TestProfileBytesIncludesOutputAffectingFields(t *testing.T) {
 		{name: "upstream project name", mutations: []mutation{{old: "  project: Kubernetes\n", new: "  project: Kubernetes Core\n"}}},
 		{name: "upstream licence identifier", mutations: []mutation{{old: "  license: Apache-2.0\n", new: "  license: MIT\n"}}},
 		{name: "destination summary", mutations: []mutation{{old: " consumable Go module.\n", new: " consumable Go library.\n"}}},
+		{name: "compatibility apiserver", mutations: []mutation{{old: "apiserver: external", new: "apiserver: local"}}},
+		{name: "forbidden modules", mutations: []mutation{{old: "forbiddenModules: []", new: "forbiddenModules:\n    - k8s.io/legacy-cloud-providers"}}},
 	}
 
 	baseline := profileBytes(t, baseProfile)

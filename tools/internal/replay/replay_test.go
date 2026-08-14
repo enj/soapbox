@@ -289,6 +289,35 @@ func TestRootWithoutContent(t *testing.T) {
 	}
 }
 
+func TestForcedUnchangedCommitPreservesReleaseBoundary(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	f := newFixture(ctx, t, gitcli.ObjectFormatSHA1)
+	f.add(ctx, "base", "content")
+	f.add(ctx, "release", "content", "base")
+
+	projection := f.newProjection("")
+	opts := f.options(func(ctx context.Context, source replay.Commit) (replay.Transformed, error) {
+		transformed, err := projection.transform(ctx, source)
+		if err != nil {
+			return replay.Transformed{}, err
+		}
+		transformed.Force = source.SHA == f.sha("release")
+		return transformed, nil
+	})
+	result := f.run(ctx, opts)
+	releaseRecord := f.record(result, "release")
+	if releaseRecord.Collapsed || releaseRecord.Destination == "" {
+		t.Fatalf("forced release record = %+v, want a written commit", releaseRecord)
+	}
+	if releaseRecord.Tree != f.record(result, "base").Tree {
+		t.Errorf("forced release tree = %s, base tree = %s", releaseRecord.Tree, f.record(result, "base").Tree)
+	}
+	if parents := f.parents(ctx, releaseRecord.Destination); !slices.Equal(parents, []string{f.destination(result, "base")}) {
+		t.Errorf("forced release parents = %v, want base destination", parents)
+	}
+}
+
 // TestEpochParent extends published history under a second profile epoch.
 //
 // The second run re-transforms a commit the first run already published. It has

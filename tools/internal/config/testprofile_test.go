@@ -2,7 +2,7 @@ package config_test
 
 // baseProfile is a complete, valid profile. Validation tests apply one targeted
 // mutation at a time so each case proves exactly one rule.
-const baseProfile = `version: 1
+const baseProfile = `version: 2
 source:
   repository: https://github.com/kubernetes/kubernetes.git
   importPrefix: k8s.io/kubernetes
@@ -53,6 +53,7 @@ types:
 dependencies:
   policy: external
   copyPackages: []
+  forbiddenModules: []
   gates:
     interoperability: true
     globalState: true
@@ -104,11 +105,10 @@ vanity:
   importPath: monis.app/kk/rbac_authorizer
   repositoryURL: https://github.com/enj/rbac_authorizer
   probeURL: https://monis.app/kk/rbac_authorizer?go-get=1
-githubApp:
-  appIDEnv: SOAPBOX_GITHUB_APP_ID
-  installationIDEnv: SOAPBOX_GITHUB_INSTALLATION_ID
-  privateKeyEnv: SOAPBOX_GITHUB_APP_PRIVATE_KEY
-  apiBaseURL: https://api.github.com
+publication:
+  mode: manual
+compatibility:
+  apiserver: external
 determinism:
   toolchain: go1.26.5
   chunkSize: 200
