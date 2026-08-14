@@ -409,6 +409,8 @@ func TestRunUpgradeTargetConfigInstallsPolicyProfile(t *testing.T) {
 		"compatibility:\n  apiserver: local\n",
 		1,
 	)
+	anchor := strings.Repeat("a", 40)
+	target = strings.Replace(target, "    anchorCommit: \"\"\n", "    anchorCommit: "+anchor+"\n", 1)
 	targetPath := filepath.Join(t.TempDir(), "target-soapbox.yaml")
 	if err := os.WriteFile(targetPath, []byte(target), 0o644); err != nil {
 		t.Fatalf("write target profile: %v", err)
@@ -455,6 +457,9 @@ func TestRunUpgradeTargetConfigInstallsPolicyProfile(t *testing.T) {
 	if cfg.Compatibility.Apiserver != config.CompatibilityApiserverLocal {
 		t.Errorf("compatibility = %q, want local", cfg.Compatibility.Apiserver)
 	}
+	if cfg.Source.Refs.AnchorCommit != anchor {
+		t.Errorf("anchorCommit = %q, want %q", cfg.Source.Refs.AnchorCommit, anchor)
+	}
 }
 
 func TestRunUpgradeTargetConfigRefusesRetarget(t *testing.T) {
@@ -477,6 +482,36 @@ func TestRunUpgradeTargetConfigRefusesRetarget(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "immutable profile field destination.branch") {
 		t.Errorf("stderr = %q, want immutable destination branch refusal", stderr.String())
+	}
+}
+
+func TestRunUpgradeTargetConfigRefusesAnchorRetarget(t *testing.T) {
+	ctx := t.Context()
+	root, engineModPath, engineSumPath := buildDerivedForCLI(ctx, t)
+	first := strings.Repeat("a", 40)
+	second := strings.Repeat("b", 40)
+	current := strings.Replace(planProfile, "    anchorCommit: \"\"\n", "    anchorCommit: "+first+"\n", 1)
+	if err := os.WriteFile(filepath.Join(root, config.DefaultFileName), []byte(current), 0o644); err != nil {
+		t.Fatalf("write anchored profile: %v", err)
+	}
+	commitAll(ctx, t, root)
+	target := strings.Replace(current, "    anchorCommit: "+first+"\n", "    anchorCommit: "+second+"\n", 1)
+	targetPath := filepath.Join(t.TempDir(), "retarget-anchor.yaml")
+	if err := os.WriteFile(targetPath, []byte(target), 0o644); err != nil {
+		t.Fatalf("write target profile: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	code := cli.Run(ctx, cli.Env{Stderr: &stderr, Dir: root}, []string{
+		"upgrade", "-engine-version", "tools/v1.5.0",
+		"-engine-mod", engineModPath, "-engine-sum", engineSumPath,
+		"-target-config", targetPath,
+	})
+	if code != cli.ExitCheck {
+		t.Fatalf("exit = %d, want %d; stderr: %s", code, cli.ExitCheck, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "immutable profile field source.refs.anchorCommit") {
+		t.Errorf("stderr = %q, want immutable anchor refusal", stderr.String())
 	}
 }
 

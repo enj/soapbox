@@ -247,6 +247,15 @@ func validateUpgradeProfileIdentity(current, target *config.Config) error {
 	if current == nil || target == nil {
 		return &upgrade.PolicyError{Err: errors.New("upgrade: current and target profiles are required")}
 	}
+	// Resolving a previously empty anchor is the one permitted identity fill. Once
+	// persisted, the anchor is immutable like every other source identity field.
+	if current.Source.Refs.AnchorCommit != "" && current.Source.Refs.AnchorCommit != target.Source.Refs.AnchorCommit {
+		return &upgrade.PolicyError{Err: fmt.Errorf(
+			"upgrade: -target-config changes immutable profile field source.refs.anchorCommit from %q to %q",
+			current.Source.Refs.AnchorCommit, target.Source.Refs.AnchorCommit,
+		)}
+	}
+
 	fields := []struct {
 		name    string
 		current string
@@ -255,7 +264,6 @@ func validateUpgradeProfileIdentity(current, target *config.Config) error {
 		{name: "source.repository", current: current.Source.Repository, target: target.Source.Repository},
 		{name: "source.importPrefix", current: current.Source.ImportPrefix, target: target.Source.ImportPrefix},
 		{name: "source.refs.minimumRelease", current: current.Source.Refs.MinimumRelease, target: target.Source.Refs.MinimumRelease},
-		{name: "source.refs.anchorCommit", current: current.Source.Refs.AnchorCommit, target: target.Source.Refs.AnchorCommit},
 		{name: "destination.module", current: current.Destination.Module, target: target.Destination.Module},
 		{name: "destination.repository", current: current.Destination.Repository, target: target.Destination.Repository},
 		{name: "destination.remote", current: current.Destination.Remote, target: target.Destination.Remote},
