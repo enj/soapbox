@@ -277,10 +277,15 @@ func TestStagingIndex_Map_Unmapped(t *testing.T) {
 	ctx := t.Context()
 	source := newSourceFixture(ctx, t)
 	other := newSourceFixture(ctx, t)
+	// Two independently created fixtures can have identical commit objects when
+	// Git records them in the same second. Extend the other history with content
+	// the source does not have so the claimed commit is objectively unrelated.
+	unrelated := other.repo.WriteAndCommit(ctx, t,
+		"UNRELATED.md", "unrelated source\n", "test: diverge unrelated history\n")
 
 	// The staging repository only knows commits from an unrelated history.
 	staging := newStagingFixture(ctx, t, []string{
-		claim("publish base", other.sha(t, "s0")),
+		claim("publish unrelated", unrelated),
 	})
 	index, err := gomodmap.NewStagingIndex(ctx, staging.Git, gomodmap.IndexOptions{
 		ModulePath: "k8s.io/api",
