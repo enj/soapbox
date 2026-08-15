@@ -335,10 +335,8 @@ func planObservedReconciliation(ctx context.Context, opts reconciliationOptions)
 		if opts.Observed[track.Ref] != track.Destination {
 			return nil, errors.New("reconciliation: observed progress ref does not match the completed track")
 		}
-	} else {
-		if !opts.AllowLegacy || !legacyBranchProvesRelease(opts.Document, branchRef, opts.Release, opts.GeneratedBranchObject) {
-			return nil, errors.New("reconciliation: no completed track or legacy state proves the observed consumer branch")
-		}
+	} else if !opts.AllowLegacy || !legacyBranchProvesRelease(opts.Document, branchRef, opts.Release, opts.GeneratedBranchObject) {
+		return nil, errors.New("reconciliation: no completed track or legacy state proves the observed consumer branch")
 	}
 
 	next := opts.Document.Clone()

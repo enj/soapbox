@@ -183,7 +183,7 @@ func TestFetchExactDownloadsObject(t *testing.T) {
 
 	// Verify the object-specific temporary ref was cleaned up.
 	tmpRef := "refs/soapbox/fetch/" + commitOID
-	cmd := exec.Command("git", "-C", local, "rev-parse", "--verify", tmpRef)
+	cmd := exec.CommandContext(t.Context(), "git", "-C", local, "rev-parse", "--verify", tmpRef)
 	if err := cmd.Run(); err == nil {
 		t.Errorf("temporary ref %s was not deleted", tmpRef)
 	}
@@ -409,7 +409,7 @@ func TestRemoteRefsViaHTTPSmartProtocol(t *testing.T) {
 
 	// Use a raw exec to test ls-remote with env-injected credentials against
 	// the HTTP server, proving the GIT_CONFIG_COUNT mechanism works for real.
-	cmd := exec.Command("git", "ls-remote", "--refs", server.URL+"/")
+	cmd := exec.CommandContext(t.Context(), "git", "ls-remote", "--refs", server.URL+"/")
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
@@ -431,7 +431,7 @@ func TestRemoteRefsViaHTTPSmartProtocol(t *testing.T) {
 	}
 
 	// Without credential: must fail.
-	cmd2 := exec.Command("git", "ls-remote", "--refs", server.URL+"/")
+	cmd2 := exec.CommandContext(t.Context(), "git", "ls-remote", "--refs", server.URL+"/")
 	cmd2.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),
@@ -490,7 +490,7 @@ func TestFetchExactViaHTTPSmartProtocol(t *testing.T) {
 	runGit(t, local, "init")
 
 	// Use raw exec to test FetchExact-equivalent via HTTP with env credentials.
-	cmd := exec.Command("git", "-C", local, "fetch", "--no-write-fetch-head", "--no-tags",
+	cmd := exec.CommandContext(t.Context(), "git", "-C", local, "fetch", "--no-write-fetch-head", "--no-tags",
 		server.URL+"/", "refs/heads/main:refs/soapbox/fetch/tmp")
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
@@ -613,7 +613,7 @@ func newTestRunner(t *testing.T, dir string) *gitcli.Runner {
 
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -633,7 +633,7 @@ func runGit(t *testing.T, dir string, args ...string) {
 
 func runGitOutput(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}

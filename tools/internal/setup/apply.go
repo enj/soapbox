@@ -85,7 +85,7 @@ func (r *run) apply(ctx context.Context) error {
 		}
 		current, err := root.ReadFile(action.Path)
 		if err != nil {
-			return &PolicyError{Err: fmt.Errorf("setup: %w: %s changed or disappeared after planning: %v", ErrApproval, action.Path, err)}
+			return &PolicyError{Err: fmt.Errorf("setup: %w: %s changed or disappeared after planning: %w", ErrApproval, action.Path, err)}
 		}
 		if got := digest(current); got != action.Digest {
 			return &PolicyError{Err: fmt.Errorf("setup: %w: %s now digests to %s, approved %s", ErrApproval, action.Path, got, action.Digest)}

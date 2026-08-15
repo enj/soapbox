@@ -386,7 +386,7 @@ func validateHexOID(s string, width int) error {
 	}
 	null := true
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return fmt.Errorf("object %q must be lowercase hexadecimal", s)
 		}
 		if c != '0' {
@@ -735,8 +735,8 @@ func completedTrackAt(doc state.Document, destination string) (*state.Track, err
 		if found != nil {
 			return nil, fmt.Errorf("discovery: completed tracks %s and %s both claim destination %s", found.Name, track.Name, destination)
 		}
-		copy := *track
-		found = &copy
+		trackCopy := *track
+		found = &trackCopy
 	}
 	return found, nil
 }
@@ -910,8 +910,8 @@ func completedTrackForRelease(doc state.Document, rel source.Release) *state.Tra
 	for i := range doc.Tracks {
 		track := &doc.Tracks[i]
 		if track.Name == rel.DestinationTag && track.Source == rel.Source.Commit && track.Done == track.Total {
-			copy := *track
-			return &copy
+			trackCopy := *track
+			return &trackCopy
 		}
 	}
 	return nil

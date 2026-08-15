@@ -133,9 +133,10 @@ func (r *run) resolveStaging(ctx context.Context, root *gomodmap.RootModule, com
 	}
 
 	tag := ""
-	if r.opts.Ref.Kind == extract.RefTag {
+	switch r.opts.Ref.Kind {
+	case extract.RefTag:
 		tag = r.opts.Ref.Name
-	} else if r.opts.Ref.Kind == extract.RefCommit {
+	case extract.RefCommit:
 		cache, err := r.cacheRunner()
 		if err != nil {
 			return nil, false, runtimeError(stageStaging, err)

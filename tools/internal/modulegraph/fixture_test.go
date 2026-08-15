@@ -157,7 +157,7 @@ func TestMain(m *testing.M) {
 	if sharedFix != nil {
 		os.RemoveAll(sharedFix.root)
 	}
-	os.Exit(code)
+	os.Exit(code) //nolint:forbidigo // TestMain must return the test result to the process
 }
 
 // shared returns the tree every test that does not need its own uses, and the

@@ -323,10 +323,10 @@ func chunkStart(ctx context.Context, opts ChunkOptions) (chunkPosition, error) {
 		if err := opts.Destination.Git.FetchExact(ctx, opts.Destination.Remote, ref, observed, opts.Discovery.Format.HexLength()); err != nil {
 			return chunkPosition{}, fmt.Errorf("replay chunk: fetch progress: %w", err)
 		}
-		copy := *track
+		trackCopy := *track
 		return chunkPosition{
 			source: track.Source, destination: track.Destination,
-			historySource: base.source, historyTag: base.tag, track: &copy,
+			historySource: base.source, historyTag: base.tag, track: &trackCopy,
 		}, nil
 	}
 	if object, exists := opts.Discovery.Observed[ref]; exists {

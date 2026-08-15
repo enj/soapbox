@@ -125,15 +125,15 @@ func validateGitConfig(entries []gitConfig) error {
 	seen := make(map[string]bool, len(entries))
 	for i, entry := range entries {
 		if entry.key == "" {
-			return fmt.Errorf("Git config entry %d has no key", i)
+			return fmt.Errorf("git config entry %d has no key", i)
 		}
 		for _, value := range []string{entry.key, entry.value} {
 			if strings.ContainsRune(value, '\x00') || strings.ContainsAny(value, "\r\n") {
-				return fmt.Errorf("Git config entry %d contains a control character", i)
+				return fmt.Errorf("git config entry %d contains a control character", i)
 			}
 		}
 		if seen[entry.key] {
-			return fmt.Errorf("Git config key %q is configured twice", entry.key)
+			return fmt.Errorf("git config key %q is configured twice", entry.key)
 		}
 		seen[entry.key] = true
 	}

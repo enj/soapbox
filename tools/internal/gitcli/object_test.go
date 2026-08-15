@@ -446,7 +446,7 @@ func TestWriteTreeFailsOnADeclinedEntry(t *testing.T) {
 
 	// A zero width non joiner sits between the g and the i. HFS+ ignores it, so
 	// the name opens the real .git directory there.
-	const sneaky = ".g‌it/config"
+	sneaky := ".g" + string(rune(0x200c)) + "it/config"
 	_, err := repo.Git.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "keep.go"},
 		{Mode: gitcli.ModeRegular, Object: blob, Path: sneaky},

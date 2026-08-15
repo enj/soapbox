@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -258,7 +259,7 @@ func TestPlanRefusesAnOwnedSymlink(t *testing.T) {
 	ctx := t.Context()
 	root, git, cfg, repo := newDerived(ctx, t)
 	outside := filepath.Join(t.TempDir(), "outside-go.mod")
-	if err := os.WriteFile(outside, []byte(engineGoMod), 0o644); err != nil {
+	if err := os.WriteFile(outside, engineGoMod, 0o644); err != nil {
 		t.Fatalf("write outside module: %v", err)
 	}
 	owned := filepath.Join(root, "tools", "go.mod")
@@ -415,9 +416,15 @@ func TestUpgradeOnlyTouchesOwnedFiles(t *testing.T) {
 			}
 			return nil
 		}
-		rel, _ := filepath.Rel(root, path)
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("relative path for %s: %w", path, err)
+		}
 		rel = filepath.ToSlash(rel)
-		data, _ := os.ReadFile(path)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", rel, err)
+		}
 		before[rel] = data
 		return nil
 	})
@@ -450,12 +457,18 @@ func TestUpgradeOnlyTouchesOwnedFiles(t *testing.T) {
 			}
 			return nil
 		}
-		rel, _ := filepath.Rel(root, path)
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return fmt.Errorf("relative path for %s: %w", path, err)
+		}
 		rel = filepath.ToSlash(rel)
 		if touched[rel] {
 			return nil
 		}
-		data, _ := os.ReadFile(path)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", rel, err)
+		}
 		if old, ok := before[rel]; ok {
 			if string(data) != string(old) {
 				t.Errorf("upgrade modified %s which is not in the manifest", rel)

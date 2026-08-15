@@ -16,6 +16,56 @@ import (
 	"github.com/enj/soapbox/tools/internal/testsupport"
 )
 
+// gitResults checks the typed results returned by Git fixture operations.
+type gitResults struct {
+	t *testing.T
+}
+
+func mustGit(t *testing.T) gitResults {
+	return gitResults{t: t}
+}
+
+func (m gitResults) object(value string, err error) string {
+	m.t.Helper()
+	if err != nil {
+		m.t.Fatalf("Git fixture operation: %v", err)
+	}
+	return value
+}
+
+func (m gitResults) refs(value []gitcli.Ref, err error) []gitcli.Ref {
+	m.t.Helper()
+	if err != nil {
+		m.t.Fatalf("Git fixture operation: %v", err)
+	}
+	return value
+}
+
+func (m gitResults) format(value gitcli.ObjectFormat, err error) gitcli.ObjectFormat {
+	m.t.Helper()
+	if err != nil {
+		m.t.Fatalf("Git fixture operation: %v", err)
+	}
+	return value
+}
+
+func (m gitResults) runner(value *gitcli.Runner, err error) *gitcli.Runner {
+	m.t.Helper()
+	if err != nil {
+		m.t.Fatalf("Git fixture operation: %v", err)
+	}
+	return value
+}
+
+// mustDo fails the test if err is non-nil. Use for operations that return only
+// an error.
+func mustDo(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // --- source cache test helper ---
 
 // newTestSource builds a source repository with annotated release tags and
@@ -126,26 +176,26 @@ func discoveryConfig(anchorCommit string) *config.Config {
 func (d *discoveryDest) publishedState(ctx context.Context, t *testing.T, sourceCommit string) (stateCommit, destCommit, tagOID string) {
 	t.Helper()
 
-	blob, _ := d.localGit.WriteBlob(ctx, []byte("published\n"))
+	blob := mustGit(t).object(d.localGit.WriteBlob(ctx, []byte("published\n")))
 	entries, listErr := d.localGit.ListTree(ctx, d.parent)
 	if listErr != nil {
 		t.Fatalf("read control-plane tree: %v", listErr)
 	}
 	entries = append(entries, gitcli.TreeEntry{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"})
-	tree, _ := d.localGit.WriteTree(ctx, entries)
-	dc, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	tree := mustGit(t).object(d.localGit.WriteTree(ctx, entries))
+	dc := mustGit(t).object(d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Parents: []string{d.parent},
 		Author: testSignature, Committer: testSignature,
 		Message: "published\n",
-	})
-	d.localGit.CreateTag(ctx, gitcli.TagOptions{
+	}))
+	mustDo(t, d.localGit.CreateTag(ctx, gitcli.TagOptions{
 		Name: testReleaseTag, Commit: dc,
 		Tagger: testSignature, Message: "Release " + testReleaseTag + "\n",
-	})
-	tagRefs, _ := d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag)
+	}))
+	tagRefs := mustGit(t).refs(d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag))
 	tOID := tagRefs[0].Target
 
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -173,13 +223,13 @@ func (d *discoveryDest) publishedState(ctx context.Context, t *testing.T, source
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testBranchRef, New: dc, ExpectAbsent: true},
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
 		{Ref: "refs/tags/" + testReleaseTag, New: tOID, ExpectAbsent: true},
-	})
-	d.localGit.UpdateRef(ctx, testBranchRef, dc, d.parent)
+	}))
+	mustDo(t, d.localGit.UpdateRef(ctx, testBranchRef, dc, d.parent))
 	return record.Commit, dc, tOID
 }
 
@@ -331,7 +381,7 @@ func TestDiscoverFixedPointNoOp(t *testing.T) {
 	if disc.StateCommit != sc {
 		t.Errorf("state commit = %q, want %q", disc.StateCommit, sc)
 	}
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	if disc.Format != format {
 		t.Errorf("format = %q, want %q", string(disc.Format), string(format))
 	}
@@ -363,42 +413,42 @@ func TestDiscoverImmutableTagConflictFromState(t *testing.T) {
 	d := newDiscoveryDest(ctx, t)
 
 	// Create the published commit and tag.
-	blob, _ := d.localGit.WriteBlob(ctx, []byte("pub\n"))
-	tree, _ := d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
+	blob := mustGit(t).object(d.localGit.WriteBlob(ctx, []byte("pub\n")))
+	tree := mustGit(t).object(d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"},
-	})
-	destCommit, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	destCommit := mustGit(t).object(d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Parents: []string{d.parent},
 		Author: testSignature, Committer: testSignature,
 		Message: "published\n",
-	})
-	d.localGit.CreateTag(ctx, gitcli.TagOptions{
+	}))
+	mustDo(t, d.localGit.CreateTag(ctx, gitcli.TagOptions{
 		Name: testReleaseTag, Commit: destCommit,
 		Tagger: testSignature, Message: "Release\n",
-	})
-	tagRefs, _ := d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag)
+	}))
+	tagRefs := mustGit(t).refs(d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag))
 	remoteTagOID := tagRefs[0].Target
 
 	// Build a second tag object at a different commit to use as the conflicting
 	// state-recorded OID.
-	blob2, _ := d.localGit.WriteBlob(ctx, []byte("other\n"))
-	tree2, _ := d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
+	blob2 := mustGit(t).object(d.localGit.WriteBlob(ctx, []byte("other\n")))
+	tree2 := mustGit(t).object(d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob2, Path: "other.go"},
-	})
-	otherCommit, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	otherCommit := mustGit(t).object(d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree2, Parents: []string{destCommit},
 		Author: testSignature, Committer: testSignature,
 		Message: "other\n",
-	})
-	d.localGit.CreateTag(ctx, gitcli.TagOptions{
+	}))
+	mustDo(t, d.localGit.CreateTag(ctx, gitcli.TagOptions{
 		Name: "conflict-helper", Commit: otherCommit,
 		Tagger: testSignature, Message: "Conflict\n",
-	})
-	helperRefs, _ := d.localGit.ListRefs(ctx, "refs/tags/conflict-helper")
+	}))
+	helperRefs := mustGit(t).refs(d.localGit.ListRefs(ctx, "refs/tags/conflict-helper"))
 	stateTagOID := helperRefs[0].Target
 
 	// Build state recording the tag at stateTagOID (different from remoteTagOID).
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -426,14 +476,14 @@ func TestDiscoverImmutableTagConflictFromState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
 
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testBranchRef, New: destCommit, ExpectAbsent: true},
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
 		{Ref: "refs/tags/" + testReleaseTag, New: remoteTagOID, ExpectAbsent: true},
-	})
-	d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent)
+	}))
+	mustDo(t, d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent))
 
 	_, err = sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -453,24 +503,24 @@ func TestDiscoverDeletedPublishedTag(t *testing.T) {
 
 	// Create the tag locally but do NOT push it to the remote, simulating
 	// a deletion after publication.
-	blob, _ := d.localGit.WriteBlob(ctx, []byte("pub\n"))
-	tree, _ := d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
+	blob := mustGit(t).object(d.localGit.WriteBlob(ctx, []byte("pub\n")))
+	tree := mustGit(t).object(d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"},
-	})
-	destCommit, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	destCommit := mustGit(t).object(d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Parents: []string{d.parent},
 		Author: testSignature, Committer: testSignature,
 		Message: "published\n",
-	})
-	d.localGit.CreateTag(ctx, gitcli.TagOptions{
+	}))
+	mustDo(t, d.localGit.CreateTag(ctx, gitcli.TagOptions{
 		Name: testReleaseTag, Commit: destCommit,
 		Tagger: testSignature, Message: "Release\n",
-	})
-	tagRefs, _ := d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag)
+	}))
+	tagRefs := mustGit(t).refs(d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag))
 	tagOID := tagRefs[0].Target
 
 	// Build state recording both branch and tag.
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -498,14 +548,14 @@ func TestDiscoverDeletedPublishedTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
 
 	// Push branch and state but NOT the tag.
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testBranchRef, New: destCommit, ExpectAbsent: true},
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
-	})
-	d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent)
+	}))
+	mustDo(t, d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent))
 
 	_, err = sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -524,19 +574,19 @@ func TestDiscoverUntrustedExtraRemoteTag(t *testing.T) {
 	d := newDiscoveryDest(ctx, t)
 	d.publishedState(ctx, t, sourceCommit)
 
-	remoteRunner, _ := d.localGit.WithDir(d.remoteDir)
-	blob, _ := remoteRunner.WriteBlob(ctx, []byte("extra\n"))
-	tree, _ := remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
+	remoteRunner := mustGit(t).runner(d.localGit.WithDir(d.remoteDir))
+	blob := mustGit(t).object(remoteRunner.WriteBlob(ctx, []byte("extra\n")))
+	tree := mustGit(t).object(remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "x.go"},
-	})
-	commit, _ := remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	commit := mustGit(t).object(remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Author: testSignature, Committer: testSignature,
 		Message: "extra\n",
-	})
-	remoteRunner.CreateTag(ctx, gitcli.TagOptions{
+	}))
+	mustDo(t, remoteRunner.CreateTag(ctx, gitcli.TagOptions{
 		Name: "v0.99.0", Commit: commit,
 		Tagger: testSignature, Message: "Extra\n",
-	})
+	}))
 
 	_, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -555,18 +605,18 @@ func TestDiscoverBranchDriftFromState(t *testing.T) {
 	d := newDiscoveryDest(ctx, t)
 	d.publishedState(ctx, t, sourceCommit)
 
-	remoteRunner, _ := d.localGit.WithDir(d.remoteDir)
-	blob, _ := remoteRunner.WriteBlob(ctx, []byte("drift\n"))
-	tree, _ := remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
+	remoteRunner := mustGit(t).runner(d.localGit.WithDir(d.remoteDir))
+	blob := mustGit(t).object(remoteRunner.WriteBlob(ctx, []byte("drift\n")))
+	tree := mustGit(t).object(remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "drift.go"},
-	})
-	commit, _ := remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	commit := mustGit(t).object(remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Author: testSignature, Committer: testSignature,
 		Message: "drift\n",
-	})
-	refs, _ := remoteRunner.ListRefs(ctx, testBranchRef)
+	}))
+	refs := mustGit(t).refs(remoteRunner.ListRefs(ctx, testBranchRef))
 	if len(refs) > 0 {
-		remoteRunner.UpdateRef(ctx, testBranchRef, commit, refs[0].Target)
+		mustDo(t, remoteRunner.UpdateRef(ctx, testBranchRef, commit, refs[0].Target))
 	}
 
 	_, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
@@ -638,18 +688,18 @@ func TestDiscoverStateCommitOverrideMismatch(t *testing.T) {
 	cache, sourceCommit := newTestSource(ctx, t, []string{testSourceTag})
 	d := newDiscoveryDest(ctx, t)
 
-	remoteRunner, _ := d.localGit.WithDir(d.remoteDir)
-	blob, _ := remoteRunner.WriteBlob(ctx, []byte("fake\n"))
-	tree, _ := remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
+	remoteRunner := mustGit(t).runner(d.localGit.WithDir(d.remoteDir))
+	blob := mustGit(t).object(remoteRunner.WriteBlob(ctx, []byte("fake\n")))
+	tree := mustGit(t).object(remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "state.json"},
-	})
-	commit, _ := remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	commit := mustGit(t).object(remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Author: testSignature, Committer: testSignature,
 		Message: "state\n",
-	})
-	remoteRunner.CreateRef(ctx, testStateRef, commit)
+	}))
+	mustDo(t, remoteRunner.CreateRef(ctx, testStateRef, commit))
 
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	wrongCommit := strings.Repeat("b", format.HexLength())
 
 	opts := d.opts(cache, sourceCommit)
@@ -668,7 +718,7 @@ func TestDiscoverStateCommitOverrideAbsent(t *testing.T) {
 	cache, sourceCommit := newTestSource(ctx, t, []string{testSourceTag})
 	d := newDiscoveryDest(ctx, t)
 
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	overrideCommit := strings.Repeat("a", format.HexLength())
 
 	opts := d.opts(cache, sourceCommit)
@@ -689,7 +739,7 @@ func TestDiscoverStateRepositoryMismatch(t *testing.T) {
 	cache, sourceCommit := newTestSource(ctx, t, []string{testSourceTag})
 	d := newDiscoveryDest(ctx, t)
 
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -713,10 +763,10 @@ func TestDiscoverStateRepositoryMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
-	})
+	}))
 
 	_, err = sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -732,7 +782,7 @@ func TestDiscoverStateModuleMismatch(t *testing.T) {
 	cache, sourceCommit := newTestSource(ctx, t, []string{testSourceTag})
 	d := newDiscoveryDest(ctx, t)
 
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -756,10 +806,10 @@ func TestDiscoverStateModuleMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
-	})
+	}))
 
 	_, err = sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -802,19 +852,19 @@ func TestDiscoverAdoptsLegacyFirstTag(t *testing.T) {
 	cfg := discoveryConfig(sourceCommit)
 	// Build a published commit with the correct provenance trailer while
 	// preserving the setup-derived control plane.
-	blob, _ := d.localGit.WriteBlob(ctx, []byte("published\n"))
+	blob := mustGit(t).object(d.localGit.WriteBlob(ctx, []byte("published\n")))
 	entries, listErr := d.localGit.ListTree(ctx, d.parent)
 	if listErr != nil {
 		t.Fatalf("read control-plane tree: %v", listErr)
 	}
 	entries = append(entries, gitcli.TreeEntry{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"})
-	tree, _ := d.localGit.WriteTree(ctx, entries)
+	tree := mustGit(t).object(d.localGit.WriteTree(ctx, entries))
 	commitMessage := "Release " + testReleaseTag + "\n\n" + cfg.Commit.TrailerKey + ": " + sourceCommit + "\n"
-	destCommit, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	destCommit := mustGit(t).object(d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Parents: []string{d.parent},
 		Author: testSignature, Committer: testSignature,
 		Message: commitMessage,
-	})
+	}))
 
 	// The tag message must carry the release source metadata keys the adoption
 	// verifies: Source-tag, Source-commit, Source-release.
@@ -823,15 +873,15 @@ func TestDiscoverAdoptsLegacyFirstTag(t *testing.T) {
 		"Source-tag: " + testSourceTag + "\n" +
 		"Source-commit: " + sourceCommit + "\n" +
 		"Source-release: " + sourceURL + "\n"
-	d.localGit.CreateTag(ctx, gitcli.TagOptions{
+	mustDo(t, d.localGit.CreateTag(ctx, gitcli.TagOptions{
 		Name: testReleaseTag, Commit: destCommit,
 		Tagger: testSignature, Message: tagMessage,
-	})
-	tagRefs, _ := d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag)
+	}))
+	tagRefs := mustGit(t).refs(d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag))
 	tagOID := tagRefs[0].Target
 
 	// Build state recording the branch but NOT the tag (legacy scenario).
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -858,14 +908,14 @@ func TestDiscoverAdoptsLegacyFirstTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
 
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testBranchRef, New: destCommit, ExpectAbsent: true},
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
 		{Ref: "refs/tags/" + testReleaseTag, New: tagOID, ExpectAbsent: true},
-	})
-	d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent)
+	}))
+	mustDo(t, d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent))
 	controlHead := d.advanceBranch(ctx, t, destCommit, "soapbox.yaml", "version: 2\n", "chore: migrate control plane\n")
 
 	discoverOpts := d.opts(cache, sourceCommit)
@@ -957,19 +1007,19 @@ func TestDiscoverRefusesNonFirstTagAdoption(t *testing.T) {
 
 	d.publishedState(ctx, t, sourceCommit)
 
-	remoteRunner, _ := d.localGit.WithDir(d.remoteDir)
-	blob, _ := remoteRunner.WriteBlob(ctx, []byte("rogue\n"))
-	tree, _ := remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
+	remoteRunner := mustGit(t).runner(d.localGit.WithDir(d.remoteDir))
+	blob := mustGit(t).object(remoteRunner.WriteBlob(ctx, []byte("rogue\n")))
+	tree := mustGit(t).object(remoteRunner.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "rogue.go"},
-	})
-	commit, _ := remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	commit := mustGit(t).object(remoteRunner.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Author: testSignature, Committer: testSignature,
 		Message: "rogue\n",
-	})
-	remoteRunner.CreateTag(ctx, gitcli.TagOptions{
+	}))
+	mustDo(t, remoteRunner.CreateTag(ctx, gitcli.TagOptions{
 		Name: "v0.37.0", Commit: commit,
 		Tagger: testSignature, Message: "Rogue\n",
-	})
+	}))
 
 	_, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -1042,18 +1092,18 @@ func TestDiscoverRefusesUnknownBranchOnRemote(t *testing.T) {
 	d := newDiscoveryDest(ctx, t)
 
 	// Push an unexpected branch to the bare remote.
-	blob, _ := d.localGit.WriteBlob(ctx, []byte("rogue\n"))
-	tree, _ := d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
+	blob := mustGit(t).object(d.localGit.WriteBlob(ctx, []byte("rogue\n")))
+	tree := mustGit(t).object(d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "rogue.go"},
-	})
-	commit, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	}))
+	commit := mustGit(t).object(d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Author: testSignature, Committer: testSignature,
 		Message: "rogue branch\n",
-	})
-	d.localGit.CreateRef(ctx, "refs/heads/rogue", commit)
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	}))
+	mustDo(t, d.localGit.CreateRef(ctx, "refs/heads/rogue", commit))
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: "refs/heads/rogue", New: commit, ExpectAbsent: true},
-	})
+	}))
 
 	_, err := sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -1070,7 +1120,7 @@ func TestDiscoverStateAnchorSourceMismatch(t *testing.T) {
 	d := newDiscoveryDest(ctx, t)
 
 	// Build state with a different anchor source.
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	wrongAnchor := strings.Repeat("f", format.HexLength())
 	doc := state.Document{
 		Schema:       state.Schema,
@@ -1095,10 +1145,10 @@ func TestDiscoverStateAnchorSourceMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
-	})
+	}))
 
 	_, err = sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -1115,7 +1165,7 @@ func TestDiscoverStateAnchorRefMismatch(t *testing.T) {
 	d := newDiscoveryDest(ctx, t)
 
 	// Build state with the correct anchor source but wrong ref.
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -1139,10 +1189,10 @@ func TestDiscoverStateAnchorRefMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testStateRef, New: record.Commit, ExpectAbsent: true},
-	})
+	}))
 
 	_, err = sync.Discover(ctx, d.opts(cache, sourceCommit))
 	if err == nil {
@@ -1164,19 +1214,19 @@ func adoptionTestSetup(ctx context.Context, t *testing.T) (*discoveryDest, *sour
 	d := newDiscoveryDest(ctx, t)
 	cfg := discoveryConfig(sourceCommit)
 
-	blob, _ := d.localGit.WriteBlob(ctx, []byte("published\n"))
-	tree, _ := d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
+	blob := mustGit(t).object(d.localGit.WriteBlob(ctx, []byte("published\n")))
+	tree := mustGit(t).object(d.localGit.WriteTree(ctx, []gitcli.TreeEntry{
 		{Mode: gitcli.ModeRegular, Object: blob, Path: "p.go"},
-	})
+	}))
 	commitMessage := "Release " + testReleaseTag + "\n\n" + cfg.Commit.TrailerKey + ": " + sourceCommit + "\n"
-	destCommit, _ := d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
+	destCommit := mustGit(t).object(d.localGit.WriteCommit(ctx, gitcli.CommitTreeOptions{
 		Tree: tree, Parents: []string{d.parent},
 		Author: testSignature, Committer: testSignature,
 		Message: commitMessage,
-	})
+	}))
 
 	// Build state recording the branch but not the tag.
-	format, _ := d.localGit.ObjectFormat(ctx)
+	format := mustGit(t).format(d.localGit.ObjectFormat(ctx))
 	doc := state.Document{
 		Schema:       state.Schema,
 		ObjectFormat: format,
@@ -1203,7 +1253,7 @@ func adoptionTestSetup(ctx context.Context, t *testing.T) (*discoveryDest, *sour
 	if err != nil {
 		t.Fatalf("store state: %v", err)
 	}
-	d.localGit.CreateRef(ctx, testStateRef, record.Commit)
+	mustDo(t, d.localGit.CreateRef(ctx, testStateRef, record.Commit))
 
 	return d, cache, sourceCommit, destCommit
 }
@@ -1212,22 +1262,22 @@ func adoptionTestSetup(ctx context.Context, t *testing.T) (*discoveryDest, *sour
 func finishAdoption(ctx context.Context, t *testing.T, d *discoveryDest, cache *source.Cache, sourceCommit, destCommit, tagMessage string) error {
 	t.Helper()
 
-	d.localGit.CreateTag(ctx, gitcli.TagOptions{
+	mustDo(t, d.localGit.CreateTag(ctx, gitcli.TagOptions{
 		Name: testReleaseTag, Commit: destCommit,
 		Tagger: testSignature, Message: tagMessage,
-	})
-	tagRefs, _ := d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag)
+	}))
+	tagRefs := mustGit(t).refs(d.localGit.ListRefs(ctx, "refs/tags/"+testReleaseTag))
 	tagOID := tagRefs[0].Target
 
-	stateRefs, _ := d.localGit.ListRefs(ctx, testStateRef)
+	stateRefs := mustGit(t).refs(d.localGit.ListRefs(ctx, testStateRef))
 	stateCommit := stateRefs[0].Target
 
-	d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
+	mustDo(t, d.localGit.PushAtomic(ctx, d.remoteDir, []gitcli.PushUpdate{
 		{Ref: testBranchRef, New: destCommit, ExpectAbsent: true},
 		{Ref: testStateRef, New: stateCommit, ExpectAbsent: true},
 		{Ref: "refs/tags/" + testReleaseTag, New: tagOID, ExpectAbsent: true},
-	})
-	d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent)
+	}))
+	mustDo(t, d.localGit.UpdateRef(ctx, testBranchRef, destCommit, d.parent))
 
 	opts := d.opts(cache, sourceCommit)
 	_, err := sync.Discover(ctx, opts)

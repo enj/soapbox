@@ -7,32 +7,15 @@ import (
 	"testing"
 )
 
-// sharedModuleCache and sharedBuildCache are the Go caches every end-to-end test
-// resolves and compiles through.
-//
-// They are the package's own rather than the developer's, and each for its own
-// reason.
-//
-// The module cache is isolated for correctness. The fixture publishes modules at
-// fixed versions through a fixture proxy, and a module cache is keyed by path and
-// version alone: a developer's cache that already held one of those versions from
-// an earlier shape of the fixture would serve that instead, and every test would
-// then be checking a tree nobody wrote.
-//
-// The build cache is isolated for reliability. These tests drive the go command
-// dozens of times, and a build cache shared with whatever else is running in the
-// same checkout is one another process can leave a half written entry in. The
-// symptom is a load that fails with an empty cache entry, which looks exactly
-// like a broken fixture and is not one.
-//
-// Both are shared across the package rather than per test, because compiling the
-// same tiny fixture for every test is pure cost.
-var (
-	sharedModuleCache string
-	sharedBuildCache  string
-)
+// sharedModuleCache is the isolated Go module cache every end-to-end test
+// resolves through. The fixture publishes modules at fixed versions through a
+// fixture proxy, and a module cache is keyed by path and version alone: a
+// developer's cache that already held one of those versions from an earlier
+// fixture would serve that instead. Sharing one isolated cache across the package
+// preserves correctness without repeatedly resolving the same tiny modules.
+var sharedModuleCache string
 
-// TestMain owns the shared caches for the whole package.
+// TestMain owns the shared module cache for the whole package.
 //
 // The removal is its own function rather than a defer because os.Exit does not
 // run defers, and a module cache left behind is a directory the go command made
@@ -41,10 +24,9 @@ func TestMain(m *testing.M) {
 	root, err := os.MkdirTemp("", "soapbox-generate")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "generate tests: cache root:", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:forbidigo // TestMain must report setup failure to the test process
 	}
 	sharedModuleCache = filepath.Join(root, "mod")
-	sharedBuildCache = filepath.Join(root, "build")
 
 	code := m.Run()
 
@@ -54,7 +36,7 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
-	os.Exit(code)
+	os.Exit(code) //nolint:forbidigo // TestMain must return the test result to the process
 }
 
 // moduleCache reports the shared module cache, failing a test that somehow ran
@@ -65,13 +47,4 @@ func moduleCache(t *testing.T) string {
 		t.Fatal("module cache: TestMain did not prepare one")
 	}
 	return sharedModuleCache
-}
-
-// buildCache reports the shared build cache.
-func buildCache(t *testing.T) string {
-	t.Helper()
-	if sharedBuildCache == "" {
-		t.Fatal("build cache: TestMain did not prepare one")
-	}
-	return sharedBuildCache
 }

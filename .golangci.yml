@@ -126,11 +126,15 @@ linters:
         linters:
           - forbidigo
         text: os.Exit
-      # These two reads are the point of the commands that perform them: the
-      # profile path comes from the operator's command line, and the allowed
-      # signers path comes from the inspected repository's own git configuration,
-      # which is the file git itself would read.
+      # These reads are the point of the commands that perform them: profile,
+      # engine, and checksum paths come from the operator's command line, and the
+      # allowed signers path comes from the inspected repository's own git
+      # configuration, which is the file git itself would read.
       - path: internal/config/config\.go
+        linters:
+          - gosec
+        text: G304
+      - path: internal/cli/upgrade\.go
         linters:
           - gosec
         text: G304

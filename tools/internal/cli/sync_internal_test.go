@@ -72,7 +72,9 @@ func TestSyncTokenUnattendedValidatesBeforeReadingToken(t *testing.T) {
 		tokenEnvName: testToken,
 	}
 	fs, flags := syncFlagSet()
-	_ = fs.Parse([]string{"-unattended"})
+	if err := fs.Parse([]string{"-unattended"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
 	usage := func(io.Writer) {}
 	_, _, err := syncToken(flags, testProfileConfig(), usage, mapLookup(env))
 	if err == nil {
@@ -89,7 +91,9 @@ func TestSyncTokenUnattendedRequiresToken(t *testing.T) {
 	env := validActionsEnv(validSHA)
 	// No token in env.
 	fs, flags := syncFlagSet()
-	_ = fs.Parse([]string{"-unattended"})
+	if err := fs.Parse([]string{"-unattended"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
 	usage := func(io.Writer) {}
 	_, _, err := syncToken(flags, testProfileConfig(), usage, mapLookup(env))
 	if err == nil {
@@ -103,7 +107,9 @@ func TestSyncTokenUnattendedRequiresToken(t *testing.T) {
 func TestSyncTokenVerifyWriteRequiresToken(t *testing.T) {
 	env := validActionsEnv(validSHA)
 	fs, flags := syncFlagSet()
-	_ = fs.Parse([]string{"-verify-write"})
+	if err := fs.Parse([]string{"-verify-write"}); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
 	usage := func(io.Writer) {}
 	_, _, err := syncToken(flags, testProfileConfig(), usage, mapLookup(env))
 	if err == nil || !strings.Contains(err.Error(), "-verify-write requires "+tokenEnvName) {
@@ -114,7 +120,9 @@ func TestSyncTokenVerifyWriteRequiresToken(t *testing.T) {
 // TestSyncTokenReturnsNilWithoutToken verifies the no-credential path.
 func TestSyncTokenReturnsNilWithoutToken(t *testing.T) {
 	fs, flags := syncFlagSet()
-	_ = fs.Parse(nil)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
 	usage := func(io.Writer) {}
 	token, ctx, err := syncToken(flags, testProfileConfig(), usage, mapLookup(nil))
 	if err != nil {
@@ -137,7 +145,9 @@ func TestSyncTokenValidatesContextWhenTokenPresent(t *testing.T) {
 		// No GITHUB_ACTIONS, so validation fails.
 	}
 	fs, flags := syncFlagSet()
-	_ = fs.Parse(nil)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
 	usage := func(io.Writer) {}
 	_, _, err := syncToken(flags, testProfileConfig(), usage, mapLookup(env))
 	if err == nil {
@@ -153,7 +163,9 @@ func TestSyncTokenSucceedsInTrustedContext(t *testing.T) {
 	env := validActionsEnv(validSHA)
 	env[tokenEnvName] = testToken
 	fs, flags := syncFlagSet()
-	_ = fs.Parse(nil)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
 	usage := func(io.Writer) {}
 	got, ctx, err := syncToken(flags, testProfileConfig(), usage, mapLookup(env))
 	if err != nil {
@@ -384,9 +396,9 @@ func TestVerifySyncWorkflowSuccess(t *testing.T) {
 	stub := newGitHubStub(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/enj/rbac_authorizer":
-			writeJSON(w, ghapi.Repository{DefaultBranch: "main"})
+			writeJSON(t, w, ghapi.Repository{DefaultBranch: "main"})
 		case "/repos/enj/rbac_authorizer/actions/workflows/sync.yml":
-			writeJSON(w, ghapi.Workflow{State: ghapi.WorkflowActive, Path: syncWorkflowPath})
+			writeJSON(t, w, ghapi.Workflow{State: ghapi.WorkflowActive, Path: syncWorkflowPath})
 		default:
 			http.NotFound(w, r)
 		}
@@ -412,7 +424,7 @@ func TestVerifySyncWorkflowDefaultBranchMismatch(t *testing.T) {
 	stub := newGitHubStub(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/enj/rbac_authorizer":
-			writeJSON(w, ghapi.Repository{DefaultBranch: "develop"})
+			writeJSON(t, w, ghapi.Repository{DefaultBranch: "develop"})
 		default:
 			http.NotFound(w, r)
 		}
@@ -433,9 +445,9 @@ func TestVerifySyncWorkflowDisabled(t *testing.T) {
 	stub := newGitHubStub(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/enj/rbac_authorizer":
-			writeJSON(w, ghapi.Repository{DefaultBranch: "main"})
+			writeJSON(t, w, ghapi.Repository{DefaultBranch: "main"})
 		case "/repos/enj/rbac_authorizer/actions/workflows/sync.yml":
-			writeJSON(w, ghapi.Workflow{State: ghapi.WorkflowDisabledInactivity, Path: syncWorkflowPath})
+			writeJSON(t, w, ghapi.Workflow{State: ghapi.WorkflowDisabledInactivity, Path: syncWorkflowPath})
 		default:
 			http.NotFound(w, r)
 		}
@@ -457,9 +469,9 @@ func TestVerifySyncWorkflowPathMismatch(t *testing.T) {
 	stub := newGitHubStub(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/enj/rbac_authorizer":
-			writeJSON(w, ghapi.Repository{DefaultBranch: "main"})
+			writeJSON(t, w, ghapi.Repository{DefaultBranch: "main"})
 		case "/repos/enj/rbac_authorizer/actions/workflows/sync.yml":
-			writeJSON(w, ghapi.Workflow{State: ghapi.WorkflowActive, Path: ".github/workflows/other/sync.yml"})
+			writeJSON(t, w, ghapi.Workflow{State: ghapi.WorkflowActive, Path: ".github/workflows/other/sync.yml"})
 		default:
 			http.NotFound(w, r)
 		}
@@ -481,15 +493,17 @@ func TestVerifySyncWorkflowBearerHeader(t *testing.T) {
 	stub := newGitHubStub(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/enj/rbac_authorizer":
-			writeJSON(w, ghapi.Repository{DefaultBranch: "main"})
+			writeJSON(t, w, ghapi.Repository{DefaultBranch: "main"})
 		case "/repos/enj/rbac_authorizer/actions/workflows/sync.yml":
-			writeJSON(w, ghapi.Workflow{State: ghapi.WorkflowActive, Path: syncWorkflowPath})
+			writeJSON(t, w, ghapi.Workflow{State: ghapi.WorkflowActive, Path: syncWorkflowPath})
 		default:
 			http.NotFound(w, r)
 		}
 	})
 	client := stub.client(t)
-	_ = verifySyncWorkflowWithClient(t.Context(), client, testProfileConfig())
+	if err := verifySyncWorkflowWithClient(t.Context(), client, testProfileConfig()); err != nil {
+		t.Fatalf("verify sync workflow: %v", err)
+	}
 
 	if len(stub.requests) != 2 {
 		t.Fatalf("expected 2 requests, got %d", len(stub.requests))
@@ -551,7 +565,10 @@ func (s *githubStub) client(t *testing.T) *ghapi.Client {
 }
 
 // writeJSON encodes v as JSON into the response.
-func writeJSON(w http.ResponseWriter, v any) {
+func writeJSON(t *testing.T, w http.ResponseWriter, v any) {
+	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Errorf("encode JSON response: %v", err)
+	}
 }

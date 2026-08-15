@@ -27,7 +27,7 @@ import (
 // the approval is an optional reviewed manifest hash for manual mode and never a
 // credential.
 const (
-	tokenEnvName    = "SOAPBOX_GITHUB_TOKEN"
+	tokenEnvName    = "SOAPBOX_GITHUB_TOKEN" //nolint:gosec // G101: environment variable name, not a credential
 	approvalEnvName = "SOAPBOX_APPROVAL"
 )
 
@@ -473,7 +473,7 @@ func validateWorkflowApproval(approval string) error {
 		return fmt.Errorf("%s must be sha256: followed by 64 lowercase hexadecimal characters", approvalEnvName)
 	}
 	for _, r := range approval[len(prefix):] {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return fmt.Errorf("%s must be sha256: followed by 64 lowercase hexadecimal characters", approvalEnvName)
 		}
 	}

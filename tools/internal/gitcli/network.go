@@ -2,6 +2,7 @@ package gitcli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -100,7 +101,7 @@ func (r *Runner) RemoteRefs(ctx context.Context, remote string, hexLength int) (
 // advertised.
 //
 // The runner must carry the same credentials that were used for RemoteRefs.
-func (r *Runner) FetchExact(ctx context.Context, remote, remoteRef, expectedOID string, hexLength int) error {
+func (r *Runner) FetchExact(ctx context.Context, remote, remoteRef, expectedOID string, hexLength int) (err error) {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("git fetch exact: %w", err)
 	}
@@ -132,29 +133,31 @@ func (r *Runner) FetchExact(ctx context.Context, remote, remoteRef, expectedOID 
 	// --no-write-fetch-head keeps FETCH_HEAD clean.
 	// --no-tags prevents auto-following tags.
 	refspec := remoteRef + ":" + tmpRef
-	_, err := r.run(ctx, "fetch", "--no-write-fetch-head", "--no-tags",
+	_, fetchErr := r.run(ctx, "fetch", "--no-write-fetch-head", "--no-tags",
 		"--end-of-options", remote, refspec)
-	if err != nil {
-		return fmt.Errorf("git fetch exact from %q ref %q: %w", safeRemote, safeRef, r.redactor.Error(err))
+	if fetchErr != nil {
+		return fmt.Errorf("git fetch exact from %q ref %q: %w", safeRemote, safeRef, r.redactor.Error(fetchErr))
 	}
 
 	cleanup := func() error {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		_, err := r.run(cleanupCtx, "update-ref", "-d", "--end-of-options", tmpRef)
-		return err
+		_, cleanupErr := r.run(cleanupCtx, "update-ref", "-d", "--end-of-options", tmpRef)
+		return cleanupErr
 	}
 	needsCleanup := true
 	defer func() {
 		if needsCleanup {
-			_ = cleanup()
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("git fetch exact: deferred tmp ref cleanup: %w", r.redactor.Error(cleanupErr)))
+			}
 		}
 	}()
 
 	// Verify the fetched object matches the advertised OID.
-	out, err := r.run(ctx, "rev-parse", "--verify", "--end-of-options", tmpRef)
-	if err != nil {
-		return fmt.Errorf("git fetch exact: verify tmp ref: %w", r.redactor.Error(err))
+	out, verifyErr := r.run(ctx, "rev-parse", "--verify", "--end-of-options", tmpRef)
+	if verifyErr != nil {
+		return fmt.Errorf("git fetch exact: verify tmp ref: %w", r.redactor.Error(verifyErr))
 	}
 	got := strings.TrimSpace(out)
 	if got != expectedOID {
@@ -162,8 +165,8 @@ func (r *Runner) FetchExact(ctx context.Context, remote, remoteRef, expectedOID 
 	}
 
 	// Delete the temporary ref — the object remains in the store.
-	if err := cleanup(); err != nil {
-		return fmt.Errorf("git fetch exact: delete tmp ref: %w", r.redactor.Error(err))
+	if deleteErr := cleanup(); deleteErr != nil {
+		return fmt.Errorf("git fetch exact: delete tmp ref: %w", r.redactor.Error(deleteErr))
 	}
 	needsCleanup = false
 	return nil
@@ -175,7 +178,7 @@ func validateHex(s string, hexLength int) error {
 		return fmt.Errorf("object %q must be a %d-character hex name", s, hexLength)
 	}
 	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return fmt.Errorf("object %q must be lowercase hexadecimal", s)
 		}
 	}

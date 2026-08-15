@@ -337,7 +337,7 @@ func TestTypeswapCopiesWhatItHandsOut(t *testing.T) {
 	lookupTypeswap(t, first, internalPkg).Syntax = nil
 	spec.Retained[0] = "example.test/also-mutated"
 
-	second, err := graph.Typeswap(t.Context(), spec)
+	_, err = graph.Typeswap(t.Context(), spec)
 	if err == nil {
 		t.Fatal("a mutated specification was accepted, so the specification was not copied")
 	}
@@ -346,7 +346,7 @@ func TestTypeswapCopiesWhatItHandsOut(t *testing.T) {
 	}
 
 	spec.Retained[0] = facadePkg
-	second, err = graph.Typeswap(t.Context(), spec)
+	second, err := graph.Typeswap(t.Context(), spec)
 	if err != nil {
 		t.Fatalf("adapt type policy graph: %v", err)
 	}

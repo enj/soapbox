@@ -1470,7 +1470,7 @@ func TestPlanChunkCheckpointsResumesAndGraftsEpoch(t *testing.T) {
 	if _, _, err := state.LoadMapping(ctx, destination.Git, secondChunk.State.Commit); err != nil {
 		t.Fatalf("completed state has no reachable mapping evidence: %v", err)
 	}
-	applied, err = enginesync.ApplyCheckpoint(ctx, secondChunk, secondChunk.Publish.Hash(), false)
+	_, err = enginesync.ApplyCheckpoint(ctx, secondChunk, secondChunk.Publish.Hash(), false)
 	if err != nil {
 		t.Fatalf("apply resumed checkpoint: %v", err)
 	}

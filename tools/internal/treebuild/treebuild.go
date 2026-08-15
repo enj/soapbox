@@ -22,7 +22,7 @@ package treebuild
 
 import (
 	"context"
-	"crypto/sha1"
+	"crypto/sha1" //nolint:gosec // G505: Git SHA-1 object names require the SHA-1 algorithm
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"

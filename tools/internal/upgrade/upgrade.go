@@ -688,8 +688,7 @@ func writeAtomic(root *os.Root, name string, contents []byte) error {
 	_, writeErr := f.Write(contents)
 	closeErr := f.Close()
 	if err := errors.Join(writeErr, closeErr); err != nil {
-		_ = root.Remove(temp)
-		return err
+		return errors.Join(err, root.Remove(temp))
 	}
 
 	if err := root.Chmod(temp, payloadFileMode); err != nil {
