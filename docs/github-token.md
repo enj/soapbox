@@ -120,7 +120,7 @@ If upgrading from a schema v1 profile that used a GitHub App:
 2. Produce a target profile with the final dependency and compatibility policy
    but `publication.mode: manual`. Run the *target* engine binary (built from the
    approved engine candidate checkout, not the old v1 shim which lacks the
-   `upgrade` command) with `soapbox upgrade -engine-version tools/v0.2.1
+   `upgrade` command) with `soapbox upgrade -engine-version tools/v0.2.2
    -engine-mod <path/to/go.mod> -engine-sum <path/to/go.sum>
    -target-config <path/to/manual/soapbox.yaml>`.
 3. Review, approve, apply, and publish that exact manifest. The target profile is

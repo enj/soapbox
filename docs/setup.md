@@ -120,9 +120,9 @@ it is the one path the engine allows to live inside the cache.
 ### setup
 
 ```text
-go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.2.1 \
+go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.2.2 \
     -engine-sum /tmp/engine.sum
-go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.2.1 \
+go run ./cmd/soapbox setup -dir .. -engine-version tools/v0.2.2 \
     -engine-sum /tmp/engine.sum -apply -approve <hash>
 ```
 
@@ -149,7 +149,7 @@ than publish an unmaintainable generated-only root. See
 ### upgrade
 
 ```text
-soapbox upgrade -engine-version tools/v0.2.1 \
+soapbox upgrade -engine-version tools/v0.2.2 \
     -engine-mod /path/to/engine/go.mod \
     -engine-sum /path/to/engine/go.sum \
     -target-config /path/to/approved/soapbox.yaml
@@ -164,7 +164,7 @@ explicit `-target-config` changes it.
 **Bootstrap note**: a schema-v1 derived shim is pinned to `tools/v0.1.0` and
 does not contain the `upgrade` command. Run the *target* engine binary — built
 from the approved engine candidate checkout or, once released, via
-`go run github.com/enj/soapbox/tools/cmd/soapbox@v0.2.1` — against
+`go run github.com/enj/soapbox/tools/cmd/soapbox@v0.2.2` — against
 `-dir <derived>`, not the old `tools/cmd/soapbox` shim inside the derived
 repository.
 

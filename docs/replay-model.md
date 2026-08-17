@@ -223,6 +223,26 @@ against real temporary repositories:
    exact tag, provenance, cursor, and completed-track proof. Repeated runs
    converge to no generation or ref movement.
 
+## Kubernetes patch staging topology
+
+Adjacent staging tags may diverge from one another only under one accepted
+shape: the previous tag sits exactly one unmerged, unclaimed dependency-update
+commit above the unique merge base of the two tags. The current tag's
+first-parent walk must begin at that base. Same-target tags (both names resolve
+to the same object) and strictly linear histories between tags are accepted
+without further proof.
+
+All other topologies are refused:
+
+- An absent or ambiguous merge base between adjacent tags.
+- A spur above the base that contains more than one commit, any merge commit,
+  or any `Kubernetes-commit` source claim.
+- A current-tag ancestry that does not reach the base through first-parent
+  links.
+
+There is no lineage union and no fallback. A refused topology is fatal for the
+release that requires it; earlier accepted releases are unaffected.
+
 A legacy state record whose immutable anchor is the first patch release can only
 prove that release's minor line. Discovery therefore ignores later minor tags
 until a separately approved transition provides a common source anchor; tags in
