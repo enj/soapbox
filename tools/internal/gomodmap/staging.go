@@ -138,6 +138,62 @@ type StagingIndex struct {
 }
 
 // IndexOptions selects the staging history one index covers.
+// StagingReleaseAnchorOptions identifies the adjacent staging release targets
+// whose bounded publication history is about to be indexed.
+type StagingReleaseAnchorOptions struct {
+	ModulePath string
+	Previous   string
+	Current    string
+}
+
+// StagingReleaseAnchor derives the oldest staging commit an adjacent release
+// walk may inspect. Kubernetes patch publishing usually advances linearly, but
+// may tag one unclaimed dependency-update commit on a side spur before the next
+// patch continues from its parent. Only that exact topology is accepted.
+func StagingReleaseAnchor(ctx context.Context, git *gitcli.Runner, opts StagingReleaseAnchorOptions) (string, error) {
+	if opts.ModulePath == "" {
+		return "", fmt.Errorf("staging release anchor: a module path is required")
+	}
+	if opts.Previous == "" || opts.Current == "" {
+		return "", fmt.Errorf("staging release anchor for %s: previous and current targets are required", opts.ModulePath)
+	}
+	previous, err := git.ResolveCommit(ctx, opts.Previous)
+	if err != nil {
+		return "", fmt.Errorf("staging release anchor for %s previous target: %w", opts.ModulePath, err)
+	}
+	current, err := git.ResolveCommit(ctx, opts.Current)
+	if err != nil {
+		return "", fmt.Errorf("staging release anchor for %s current target: %w", opts.ModulePath, err)
+	}
+	linear, err := git.IsAncestor(ctx, previous, current)
+	if err != nil {
+		return "", fmt.Errorf("staging release anchor for %s: ancestry: %w", opts.ModulePath, err)
+	}
+	if linear {
+		return previous, nil
+	}
+
+	base, err := git.MergeBase(ctx, previous, current)
+	if err != nil {
+		return "", fmt.Errorf("staging release anchor for %s: divergent targets %s and %s: %w", opts.ModulePath, previous, current, err)
+	}
+	metadata, err := git.CommitInfo(ctx, previous)
+	if err != nil {
+		return "", fmt.Errorf("staging release anchor for %s previous target: %w", opts.ModulePath, err)
+	}
+	if len(metadata.Parents) != 1 || metadata.Parents[0] != base {
+		return "", fmt.Errorf(
+			"staging release anchor for %s: previous target %s must be one unmerged commit above unique base %s, parents are %v",
+			opts.ModulePath, previous, base, metadata.Parents)
+	}
+	if claims := metadata.TrailerValues(KubernetesCommitTrailer); len(claims) != 0 {
+		return "", fmt.Errorf(
+			"staging release anchor for %s: divergent previous target %s carries %d %s trailers",
+			opts.ModulePath, previous, len(claims), KubernetesCommitTrailer)
+	}
+	return base, nil
+}
+
 type IndexOptions struct {
 	// ModulePath is the staging module the repository publishes, such as
 	// k8s.io/api.
@@ -164,12 +220,13 @@ func NewStagingIndex(ctx context.Context, git *gitcli.Runner, opts IndexOptions)
 		Include: []string{opts.Revision}, FirstParent: true, MaxCount: opts.MaxCount,
 	}
 	var anchor *gitcli.Commit
+	var revision string
 	if opts.Anchor != "" {
 		anchorCommit, err := git.ResolveCommit(ctx, opts.Anchor)
 		if err != nil {
 			return nil, fmt.Errorf("staging index for %s anchor: %w", opts.ModulePath, err)
 		}
-		revision, err := git.ResolveCommit(ctx, opts.Revision)
+		revision, err = git.ResolveCommit(ctx, opts.Revision)
 		if err != nil {
 			return nil, fmt.Errorf("staging index for %s: %w", opts.ModulePath, err)
 		}
@@ -186,12 +243,23 @@ func NewStagingIndex(ctx context.Context, git *gitcli.Runner, opts IndexOptions)
 		}
 		anchor = &metadata
 		logOptions.Exclude = []string{anchorCommit}
+		// Read the complete bounded first-parent range so its connection to the
+		// inclusive anchor can be proved before an observational MaxCount is applied.
+		logOptions.MaxCount = 0
 	}
 	commits, err := git.CommitLog(ctx, logOptions)
 	if err != nil {
 		return nil, fmt.Errorf("staging index for %s: %w", opts.ModulePath, err)
 	}
 	if anchor != nil {
+		if revision != anchor.SHA {
+			if len(commits) == 0 || len(commits[0].Parents) == 0 || commits[0].Parents[0] != anchor.SHA {
+				return nil, fmt.Errorf("staging index for %s: anchor %s is not the first-parent boundary of revision %s", opts.ModulePath, anchor.SHA, revision)
+			}
+		}
+		if opts.MaxCount > 0 && len(commits) > opts.MaxCount {
+			commits = commits[len(commits)-opts.MaxCount:]
+		}
 		commits = append([]gitcli.Commit{*anchor}, commits...)
 	}
 

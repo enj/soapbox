@@ -99,25 +99,47 @@ func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToE
 			UserEmail: "k8s-publishing-bot@users.noreply.github.com",
 		})
 		repo.SetConfig(ctx, t, "uploadpack.allowFilter", "true")
-		commit := repo.WriteAndCommit(ctx, t, "published.txt", modulePath+"\n",
+		base := repo.WriteAndCommit(ctx, t, "published.txt", modulePath+"\n",
 			"publish staging module\n\n"+gomodmap.KubernetesCommitTrailer+": "+e.upstream.commit+"\n")
 		tagger := gitcli.Signature{
 			Name:  "Kubernetes Publishing Bot",
 			Email: "k8s-publishing-bot@users.noreply.github.com",
 			Date:  "2026-01-02T03:04:05Z",
 		}
-		if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
-			Name: stagingTag, Commit: commit, Message: "staging " + stagingTag + "\n", Tagger: tagger,
-		}); err != nil {
-			t.Fatalf("tag staging module %s: %v", modulePath, err)
-		}
+		commitSignature := tagger
+		commitSignature.Date = "1767323045 +0000"
+		commit := base
 		if stagingTag != fixtureStagingTag {
+			tree, err := repo.Git.ResolveTree(ctx, base)
+			if err != nil {
+				t.Fatalf("resolve staging module %s tree: %v", modulePath, err)
+			}
+			oldTarget, err := repo.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
+				Tree: tree, Parents: []string{base}, Message: "update dependencies for previous tag\n",
+				Author: commitSignature, Committer: commitSignature,
+			})
+			if err != nil {
+				t.Fatalf("write staging module %s previous tag spur: %v", modulePath, err)
+			}
+			commit, err = repo.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
+				Tree: tree, Parents: []string{base},
+				Message: "publish current staging module\n\n" + gomodmap.KubernetesCommitTrailer + ": " + e.upstream.commit + "\n",
+				Author:  commitSignature, Committer: commitSignature,
+			})
+			if err != nil {
+				t.Fatalf("write staging module %s current lineage: %v", modulePath, err)
+			}
 			if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
-				Name: fixtureStagingTag, Commit: commit,
+				Name: fixtureStagingTag, Commit: oldTarget,
 				Message: "staging " + fixtureStagingTag + "\n", Tagger: tagger,
 			}); err != nil {
 				t.Fatalf("tag staging module %s anchor: %v", modulePath, err)
 			}
+		}
+		if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
+			Name: stagingTag, Commit: commit, Message: "staging " + stagingTag + "\n", Tagger: tagger,
+		}); err != nil {
+			t.Fatalf("tag staging module %s: %v", modulePath, err)
 		}
 		commits[modulePath] = commit
 		pseudos[modulePath] = "v0.0.0-20260102030405-" + commit[:12]

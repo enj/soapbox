@@ -60,6 +60,180 @@ func TestStagingRepository(t *testing.T) {
 	}
 }
 
+func writeStagingCommit(ctx context.Context, t *testing.T, repo *testsupport.Repo, parents []string, message string) string {
+	t.Helper()
+	var tree string
+	var err error
+	if len(parents) == 0 {
+		blob, blobErr := repo.Git.WriteBlob(ctx, []byte(message))
+		if blobErr != nil {
+			t.Fatalf("write topology blob: %v", blobErr)
+		}
+		tree, err = repo.Git.WriteTree(ctx, []gitcli.TreeEntry{{
+			Mode: gitcli.ModeRegular, Object: blob, Path: "topology.txt",
+		}})
+	} else {
+		tree, err = repo.Git.ResolveTree(ctx, parents[0])
+	}
+	if err != nil {
+		t.Fatalf("resolve topology tree: %v", err)
+	}
+	signature := gitcli.Signature{Name: fixtureUserName, Email: fixtureUserEmail, Date: fixtureDate}
+	commit, err := repo.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
+		Tree: tree, Parents: parents, Message: message,
+		Author: signature, Committer: signature,
+	})
+	if err != nil {
+		t.Fatalf("write topology commit: %v", err)
+	}
+	return commit
+}
+
+func newStagingTopology(ctx context.Context, t *testing.T) (*testsupport.Repo, string) {
+	t.Helper()
+	repo := testsupport.NewRepo(ctx, t, testsupport.Options{
+		Branch: "master", UserName: fixtureUserName, UserEmail: fixtureUserEmail,
+	})
+	base := repo.WriteAndCommit(ctx, t, "base.go", "package staging\n", claim("publish base", strings.Repeat("a", 40)))
+	return repo, base
+}
+
+func TestStagingReleaseAnchor(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	repo, base := newStagingTopology(ctx, t)
+	linear := writeStagingCommit(ctx, t, repo, []string{base}, claim("publish linear", strings.Repeat("b", 40)))
+	spur := writeStagingCommit(ctx, t, repo, []string{base}, "update dependencies for previous tag\n")
+	current := writeStagingCommit(ctx, t, repo, []string{base}, claim("publish current", strings.Repeat("c", 40)))
+
+	tests := []struct {
+		name     string
+		previous string
+		current  string
+		want     string
+	}{
+		{name: "same target", previous: base, current: base, want: base},
+		{name: "linear targets", previous: base, current: linear, want: base},
+		{name: "one unclaimed previous tag spur", previous: spur, current: current, want: base},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := gomodmap.StagingReleaseAnchor(ctx, repo.Git, gomodmap.StagingReleaseAnchorOptions{
+				ModulePath: "k8s.io/api", Previous: test.previous, Current: test.current,
+			})
+			if err != nil {
+				t.Fatalf("derive staging release anchor: %v", err)
+			}
+			if got != test.want {
+				t.Errorf("anchor = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestStagingReleaseAnchorRejectsUnknownDivergence(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tests := []struct {
+		name    string
+		arrange func(*testing.T, *testsupport.Repo, string) (string, string)
+		want    string
+	}{
+		{
+			name: "two commit spur",
+			arrange: func(t *testing.T, repo *testsupport.Repo, base string) (string, string) {
+				first := writeStagingCommit(ctx, t, repo, []string{base}, "first old spur\n")
+				previous := writeStagingCommit(ctx, t, repo, []string{first}, "second old spur\n")
+				current := writeStagingCommit(ctx, t, repo, []string{base}, claim("current", strings.Repeat("b", 40)))
+				return previous, current
+			},
+			want: "must be one unmerged commit",
+		},
+		{
+			name: "claimed spur",
+			arrange: func(t *testing.T, repo *testsupport.Repo, base string) (string, string) {
+				previous := writeStagingCommit(ctx, t, repo, []string{base}, claim("claimed old spur", strings.Repeat("b", 40)))
+				current := writeStagingCommit(ctx, t, repo, []string{base}, claim("current", strings.Repeat("c", 40)))
+				return previous, current
+			},
+			want: "carries 1 Kubernetes-commit trailers",
+		},
+		{
+			name: "duplicate claims on spur",
+			arrange: func(t *testing.T, repo *testsupport.Repo, base string) (string, string) {
+				message := "claimed old spur\n\n" +
+					gomodmap.KubernetesCommitTrailer + ": " + strings.Repeat("b", 40) + "\n" +
+					gomodmap.KubernetesCommitTrailer + ": " + strings.Repeat("c", 40) + "\n"
+				previous := writeStagingCommit(ctx, t, repo, []string{base}, message)
+				current := writeStagingCommit(ctx, t, repo, []string{base}, claim("current", strings.Repeat("d", 40)))
+				return previous, current
+			},
+			want: "carries 2 Kubernetes-commit trailers",
+		},
+		{
+			name: "old side merge",
+			arrange: func(t *testing.T, repo *testsupport.Repo, base string) (string, string) {
+				orphan := writeStagingCommit(ctx, t, repo, nil, "unrelated root\n")
+				previous := writeStagingCommit(ctx, t, repo, []string{base, orphan}, "old tag merge\n")
+				current := writeStagingCommit(ctx, t, repo, []string{base}, claim("current", strings.Repeat("b", 40)))
+				return previous, current
+			},
+			want: "parents are",
+		},
+		{
+			name: "no common ancestor",
+			arrange: func(t *testing.T, repo *testsupport.Repo, base string) (string, string) {
+				previous := writeStagingCommit(ctx, t, repo, nil, "unrelated previous root\n")
+				current := writeStagingCommit(ctx, t, repo, []string{base}, claim("current", strings.Repeat("b", 40)))
+				return previous, current
+			},
+			want: "no common ancestor",
+		},
+		{
+			name: "ambiguous merge base",
+			arrange: func(t *testing.T, repo *testsupport.Repo, base string) (string, string) {
+				left := writeStagingCommit(ctx, t, repo, []string{base}, "left\n")
+				right := writeStagingCommit(ctx, t, repo, []string{base}, "right\n")
+				previous := writeStagingCommit(ctx, t, repo, []string{left, right}, "merge left first\n")
+				current := writeStagingCommit(ctx, t, repo, []string{right, left}, "merge right first\n")
+				return previous, current
+			},
+			want: "more than one best common ancestor",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			repo, base := newStagingTopology(ctx, t)
+			previous, current := test.arrange(t, repo, base)
+			_, err := gomodmap.StagingReleaseAnchor(ctx, repo.Git, gomodmap.StagingReleaseAnchorOptions{
+				ModulePath: "k8s.io/api", Previous: previous, Current: current,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("derive staging release anchor error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestNewStagingIndexRejectsNonFirstParentAnchor(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	repo, base := newStagingTopology(ctx, t)
+	mainline := writeStagingCommit(ctx, t, repo, []string{base}, claim("mainline", strings.Repeat("b", 40)))
+	side := writeStagingCommit(ctx, t, repo, []string{base}, claim("side", strings.Repeat("c", 40)))
+	head := writeStagingCommit(ctx, t, repo, []string{mainline, side}, claim("merge", strings.Repeat("d", 40)))
+
+	_, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+		ModulePath: "k8s.io/api", Revision: head, Anchor: side,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not the first-parent boundary") {
+		t.Fatalf("new staging index error = %v, want first-parent boundary refusal", err)
+	}
+}
+
 func newSourceFixture(ctx context.Context, t *testing.T) *sourceFixture {
 	t.Helper()
 

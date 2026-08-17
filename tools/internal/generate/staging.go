@@ -260,10 +260,19 @@ func (r *run) resolveIntermediateStaging(ctx context.Context, root *gomodmap.Roo
 		for _, revision := range revisions {
 			byTag[revision.Name] = revision
 		}
-		index, err := gomodmap.NewStagingIndex(ctx, cache.Git().WithNoLazyFetch(), gomodmap.IndexOptions{
+		stagingGit := cache.Git().WithNoLazyFetch()
+		anchor, err := gomodmap.StagingReleaseAnchor(ctx, stagingGit, gomodmap.StagingReleaseAnchorOptions{
+			ModulePath: modulePath,
+			Previous:   byTag[stagingAnchorTag].Commit,
+			Current:    byTag[stagingTag].Commit,
+		})
+		if err != nil {
+			return nil, err
+		}
+		index, err := gomodmap.NewStagingIndex(ctx, stagingGit, gomodmap.IndexOptions{
 			ModulePath: modulePath,
 			Revision:   byTag[stagingTag].Commit,
-			Anchor:     byTag[stagingAnchorTag].Commit,
+			Anchor:     anchor,
 		})
 		if err != nil {
 			return nil, err
