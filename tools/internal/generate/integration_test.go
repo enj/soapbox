@@ -1,11 +1,14 @@
 package generate_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
+	goformat "go/format"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -834,6 +837,19 @@ func TestGenerateProducesCompleteModule(t *testing.T) {
 	written := walkTree(t, e.roots.output)
 	if !slices.Equal(written, got) {
 		t.Errorf("written tree differs from the reported one:\n written:\n  %s\n reported:\n  %s", joinLines(written), joinLines(got))
+	}
+	for _, file := range result.Files.Files {
+		if path.Ext(file.Path) != ".go" {
+			continue
+		}
+		formatted, err := goformat.Source(file.Contents)
+		if err != nil {
+			t.Errorf("format generated %s: %v", file.Path, err)
+			continue
+		}
+		if !bytes.Equal(formatted, file.Contents) {
+			t.Errorf("generated Go file %s is not gofmt clean", file.Path)
+		}
 	}
 }
 

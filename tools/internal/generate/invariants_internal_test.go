@@ -299,3 +299,32 @@ func TestReportScrubsSourceRemote(t *testing.T) {
 		t.Fatalf("failure did not mark the scrubbed source remote: %q", report.Failure.Message)
 	}
 }
+
+func TestFormatComposedGoFiles(t *testing.T) {
+	original := relocate.FileSet{Files: []relocate.File{
+		{Path: "pkg/p.go", Mode: relocate.ModeRegular, Contents: []byte("package p\nvar X=1\n")},
+		{Path: "README.md", Mode: relocate.ModeRegular, Contents: []byte("unchanged\n")},
+	}}
+	formatted, err := formatComposedGoFiles(original)
+	if err != nil {
+		t.Fatalf("format composed files: %v", err)
+	}
+	if got, want := string(formatted.Files[0].Contents), "package p\n\nvar X = 1\n"; got != want {
+		t.Errorf("formatted Go file = %q, want %q", got, want)
+	}
+	if got := string(formatted.Files[1].Contents); got != "unchanged\n" {
+		t.Errorf("formatted non-Go file = %q", got)
+	}
+	if got := string(original.Files[0].Contents); got != "package p\nvar X=1\n" {
+		t.Errorf("formatting mutated input = %q", got)
+	}
+}
+
+func TestFormatComposedGoFilesRejectsInvalidSource(t *testing.T) {
+	_, err := formatComposedGoFiles(relocate.FileSet{Files: []relocate.File{{
+		Path: "pkg/broken.go", Mode: relocate.ModeRegular, Contents: []byte("package"),
+	}}})
+	if err == nil || !strings.Contains(err.Error(), "pkg/broken.go") {
+		t.Fatalf("format composed files error = %v, want path-specific syntax failure", err)
+	}
+}

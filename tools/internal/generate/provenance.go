@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/format"
+	"path"
 	"slices"
 	"strings"
 
@@ -70,6 +72,10 @@ func (r *run) runProvenance(ctx context.Context) error {
 	if err != nil {
 		return policyError(stageProvenance, err)
 	}
+	set, err = formatComposedGoFiles(set)
+	if err != nil {
+		return runtimeError(stageProvenance, err)
+	}
 	if err := options.CrossCheck(set); err != nil {
 		return classify(stageProvenance, err, provenanceSemantic...)
 	}
@@ -77,6 +83,28 @@ func (r *run) runProvenance(ctx context.Context) error {
 	r.files = set
 	r.report.recordProvenance(options, files)
 	return nil
+}
+
+// formatComposedGoFiles applies the pinned toolchain's gofmt rules only after
+// every rewrite and generated compatibility file has reached the final tree.
+// Formatting earlier would let a later import rewrite publish an unformatted
+// result; go/format preserves intentional import groups and does not apply
+// goimports-style regrouping.
+func formatComposedGoFiles(set relocate.FileSet) (relocate.FileSet, error) {
+	formatted := set
+	formatted.Files = slices.Clone(set.Files)
+	for i := range formatted.Files {
+		file := &formatted.Files[i]
+		if file.Mode == relocate.ModeSymlink || path.Ext(file.Path) != ".go" {
+			continue
+		}
+		contents, err := format.Source(file.Contents)
+		if err != nil {
+			return relocate.FileSet{}, fmt.Errorf("format composed Go file %s: %w", file.Path, err)
+		}
+		file.Contents = contents
+	}
+	return formatted, nil
 }
 
 // readGrants reads the upstream licence and optional notice at the source
