@@ -89,6 +89,42 @@ func writeStagingCommit(ctx context.Context, t *testing.T, repo *testsupport.Rep
 	return commit
 }
 
+func writeStagingFileCommit(ctx context.Context, t *testing.T, repo *testsupport.Repo, parent, path, contents, message string) string {
+	t.Helper()
+	entries, err := repo.Git.ListTree(ctx, parent)
+	if err != nil {
+		t.Fatalf("read topology tree: %v", err)
+	}
+	blob, err := repo.Git.WriteBlob(ctx, []byte(contents))
+	if err != nil {
+		t.Fatalf("write topology file: %v", err)
+	}
+	replaced := false
+	for i := range entries {
+		if entries[i].Path == path {
+			entries[i] = gitcli.TreeEntry{Mode: gitcli.ModeRegular, Object: blob, Path: path}
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		entries = append(entries, gitcli.TreeEntry{Mode: gitcli.ModeRegular, Object: blob, Path: path})
+	}
+	tree, err := repo.Git.WriteTree(ctx, entries)
+	if err != nil {
+		t.Fatalf("write topology tree: %v", err)
+	}
+	signature := gitcli.Signature{Name: fixtureUserName, Email: fixtureUserEmail, Date: fixtureDate}
+	commit, err := repo.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
+		Tree: tree, Parents: []string{parent}, Message: message,
+		Author: signature, Committer: signature,
+	})
+	if err != nil {
+		t.Fatalf("write topology file commit: %v", err)
+	}
+	return commit
+}
+
 func newStagingTopology(ctx context.Context, t *testing.T) (*testsupport.Repo, string) {
 	t.Helper()
 	repo := testsupport.NewRepo(ctx, t, testsupport.Options{
@@ -234,6 +270,19 @@ func TestNewStagingIndexRejectsNonFirstParentAnchor(t *testing.T) {
 	}
 }
 
+func TestNewStagingIndexRejectsNegativeMaxCountWithAnchor(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	repo, anchor := newStagingTopology(ctx, t)
+	current := writeStagingCommit(ctx, t, repo, []string{anchor}, claim("publish current", strings.Repeat("b", 40)))
+	_, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+		ModulePath: "k8s.io/api", Revision: current, Anchor: anchor, MaxCount: -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("new staging index error = %v, want negative-bound refusal", err)
+	}
+}
+
 func newSourceFixture(ctx context.Context, t *testing.T) *sourceFixture {
 	t.Helper()
 
@@ -346,6 +395,323 @@ func newStagingFixture(ctx context.Context, t *testing.T, messages []string) *te
 		repo.WriteAndCommit(ctx, t, "file.go", strings.Repeat("x", i+1)+"\n", message)
 	}
 	return repo
+}
+
+func TestCarryForwardStagingMapping(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	source := newSourceFixture(ctx, t)
+	mainline, err := gomodmap.NewSourceMainline(ctx, source.repo.Git, gomodmap.MainlineOptions{
+		Revision: source.sha(t, "s4"), Anchor: source.sha(t, "s1"),
+	})
+	if err != nil {
+		t.Fatalf("build source mainline: %v", err)
+	}
+
+	t.Run("divergent unclaimed release delta", func(t *testing.T) {
+		repo, base := newStagingTopology(ctx, t)
+		previous := writeStagingCommit(ctx, t, repo, []string{base}, "previous dependency update\n")
+		current := writeStagingCommit(ctx, t, repo, []string{base}, "current dependency update\n")
+		anchor, err := gomodmap.StagingReleaseAnchor(ctx, repo.Git, gomodmap.StagingReleaseAnchorOptions{
+			ModulePath: "k8s.io/cri-streaming", Previous: previous, Current: current,
+		})
+		if err != nil {
+			t.Fatalf("derive release anchor: %v", err)
+		}
+		index, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+			ModulePath: "k8s.io/cri-streaming", Revision: current, Anchor: anchor, Previous: previous,
+		})
+		if err != nil {
+			t.Fatalf("build staging index: %v", err)
+		}
+		mapping, err := mapStagingRelease(ctx, index, repo.Git, mainline, previous, current, "v0.36.2")
+		if err != nil {
+			t.Fatalf("map adjacent release: %v", err)
+		}
+		assertCarriedMapping(t, mapping, source, previous)
+	})
+
+	t.Run("same release target", func(t *testing.T) {
+		repo, target := newStagingTopology(ctx, t)
+		index, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+			ModulePath: "k8s.io/streaming", Revision: target, Anchor: target, Previous: target,
+		})
+		if err != nil {
+			t.Fatalf("build staging index: %v", err)
+		}
+		mapping, err := mapStagingRelease(ctx, index, repo.Git, mainline, target, target, "v0.36.2")
+		if err != nil {
+			t.Fatalf("map adjacent release: %v", err)
+		}
+		assertCarriedMapping(t, mapping, source, target)
+	})
+
+	t.Run("entirely unclaimed same target", func(t *testing.T) {
+		repo := testsupport.NewRepo(ctx, t, testsupport.Options{
+			Branch: "master", UserName: fixtureUserName, UserEmail: fixtureUserEmail,
+		})
+		target := repo.WriteAndCommit(ctx, t, "go.mod", "module k8s.io/api\n\ngo 1.26.0\n", "dependency update\n")
+		index, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+			ModulePath: "k8s.io/api", Revision: target, Anchor: target, Previous: target,
+		})
+		if err != nil {
+			t.Fatalf("build unclaimed release index: %v", err)
+		}
+		mapping, err := mapStagingRelease(ctx, index, repo.Git, mainline, target, target, "v0.36.2")
+		if err != nil {
+			t.Fatalf("map unclaimed adjacent release: %v", err)
+		}
+		assertCarriedMapping(t, mapping, source, target)
+	})
+}
+
+func assertCarriedMapping(t *testing.T, mapping gomodmap.CommitMapping, source *sourceFixture, target string) {
+	t.Helper()
+	if mapping.Source != source.sha(t, "s4") || mapping.Matched != source.sha(t, "s1") ||
+		mapping.Staging != target || mapping.Version != "v0.36.2" || mapping.Distance != 3 || !mapping.Carried {
+		t.Fatalf("carry-forward mapping = %#v", mapping)
+	}
+	if !mapping.Collapsed() {
+		t.Error("carry-forward mapping should be collapsed onto the prior release boundary")
+	}
+}
+
+func TestCarryForwardStagingMappingRejectsUnprovedCarry(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	source := newSourceFixture(ctx, t)
+	mainline, err := gomodmap.NewSourceMainline(ctx, source.repo.Git, gomodmap.MainlineOptions{
+		Revision: source.sha(t, "s4"), Anchor: source.sha(t, "s1"),
+	})
+	if err != nil {
+		t.Fatalf("build source mainline: %v", err)
+	}
+
+	t.Run("new unrelated claim", func(t *testing.T) {
+		repo, base := newStagingTopology(ctx, t)
+		previous := writeStagingCommit(ctx, t, repo, []string{base}, "previous dependency update\n")
+		current := writeStagingCommit(ctx, t, repo, []string{base}, claim("unrelated current claim", strings.Repeat("e", 40)))
+		index := stagingReleaseIndex(ctx, t, repo, previous, current, 0)
+		_, err := mapStagingRelease(ctx, index, repo.Git, mainline, previous, current, "v0.36.2")
+		if err == nil || !strings.Contains(err.Error(), "no commit claims") {
+			t.Fatalf("map release error = %v, want unmapped claim refusal", err)
+		}
+	})
+
+	t.Run("sampled index", func(t *testing.T) {
+		repo, base := newStagingTopology(ctx, t)
+		previous := writeStagingCommit(ctx, t, repo, []string{base}, "previous dependency update\n")
+		current := writeStagingCommit(ctx, t, repo, []string{base}, "current dependency update\n")
+		index := stagingReleaseIndex(ctx, t, repo, previous, current, 1)
+		_, err := mapStagingRelease(ctx, index, repo.Git, mainline, previous, current, "v0.36.2")
+		if err == nil || !strings.Contains(err.Error(), "sampled index") {
+			t.Fatalf("map release error = %v, want sampled-index refusal", err)
+		}
+	})
+
+	t.Run("claim-free package source change", func(t *testing.T) {
+		repo, base := newStagingTopology(ctx, t)
+		previous := writeStagingCommit(ctx, t, repo, []string{base}, "previous dependency update\n")
+		current := writeStagingFileCommit(ctx, t, repo, base, "types.go", "package api\n", "current unclaimed source change\n")
+		index := stagingReleaseIndex(ctx, t, repo, previous, current, 0)
+		_, err := mapStagingRelease(ctx, index, repo.Git, mainline, previous, current, "v0.36.2")
+		if err == nil || !strings.Contains(err.Error(), "claim-free delta changes package source") {
+			t.Fatalf("map release error = %v, want package-source refusal", err)
+		}
+	})
+
+	t.Run("mismatched previous target", func(t *testing.T) {
+		repo, base := newStagingTopology(ctx, t)
+		previous := writeStagingCommit(ctx, t, repo, []string{base}, "previous dependency update\n")
+		otherPrevious := writeStagingCommit(ctx, t, repo, []string{base}, "different previous dependency update\n")
+		current := writeStagingCommit(ctx, t, repo, []string{base}, "current dependency update\n")
+		index := stagingReleaseIndex(ctx, t, repo, previous, current, 0)
+		_, err := mapStagingRelease(ctx, index, repo.Git, mainline, otherPrevious, current, "v0.36.2")
+		if err == nil || !strings.Contains(err.Error(), "does not match indexed target") {
+			t.Fatalf("map release error = %v, want previous-target mismatch", err)
+		}
+	})
+
+	t.Run("mismatched current target", func(t *testing.T) {
+		repo, target := newStagingTopology(ctx, t)
+		index, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+			ModulePath: "k8s.io/api", Revision: target, Anchor: target, Previous: target,
+		})
+		if err != nil {
+			t.Fatalf("build staging index: %v", err)
+		}
+		_, err = mapStagingRelease(ctx, index, repo.Git, mainline, target, strings.Repeat("e", 40), "v0.36.2")
+		if err == nil || !strings.Contains(err.Error(), "does not match indexed revision") {
+			t.Fatalf("map release error = %v, want revision mismatch", err)
+		}
+	})
+
+	t.Run("malformed targets", func(t *testing.T) {
+		repo, target := newStagingTopology(ctx, t)
+		index, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+			ModulePath: "k8s.io/api", Revision: target, Anchor: target, Previous: target,
+		})
+		if err != nil {
+			t.Fatalf("build staging index: %v", err)
+		}
+		for _, test := range []struct {
+			name     string
+			previous string
+			current  string
+			want     string
+		}{
+			{name: "previous", previous: "bad", current: target, want: "previous target"},
+			{name: "current", previous: target, current: "bad", want: "current target"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				_, err := mapStagingRelease(ctx, index, repo.Git, mainline, test.previous, test.current, "v0.36.2")
+				if err == nil || !strings.Contains(err.Error(), test.want) {
+					t.Fatalf("map release error = %v, want %q", err, test.want)
+				}
+			})
+		}
+	})
+
+	t.Run("invalid previous version", func(t *testing.T) {
+		repo, base := newStagingTopology(ctx, t)
+		previous := writeStagingCommit(ctx, t, repo, []string{base}, "previous dependency update\n")
+		current := writeStagingCommit(ctx, t, repo, []string{base}, "current dependency update\n")
+		index := stagingReleaseIndex(ctx, t, repo, previous, current, 0)
+		_, err := mapStagingRelease(ctx, index, repo.Git, mainline, previous, current, "latest")
+		if err == nil || !strings.Contains(err.Error(), "previous version") {
+			t.Fatalf("map release error = %v, want invalid-version refusal", err)
+		}
+	})
+
+	t.Run("missing mainline", func(t *testing.T) {
+		repo, target := newStagingTopology(ctx, t)
+		index, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+			ModulePath: "k8s.io/api", Revision: target, Anchor: target, Previous: target,
+		})
+		if err != nil {
+			t.Fatalf("build staging index: %v", err)
+		}
+		_, err = mapStagingRelease(ctx, index, repo.Git, nil, target, target, "v0.36.2")
+		if err == nil || !strings.Contains(err.Error(), "source mainline") {
+			t.Fatalf("map release error = %v, want missing-mainline refusal", err)
+		}
+	})
+}
+
+func stagingReleaseIndex(ctx context.Context, t *testing.T, repo *testsupport.Repo, previous, current string, maxCount int) *gomodmap.StagingIndex {
+	t.Helper()
+	anchor, err := gomodmap.StagingReleaseAnchor(ctx, repo.Git, gomodmap.StagingReleaseAnchorOptions{
+		ModulePath: "k8s.io/api", Previous: previous, Current: current,
+	})
+	if err != nil {
+		t.Fatalf("derive release anchor: %v", err)
+	}
+	index, err := gomodmap.NewStagingIndex(ctx, repo.Git, gomodmap.IndexOptions{
+		ModulePath: "k8s.io/api", Revision: current, Anchor: anchor,
+		Previous: previous, MaxCount: maxCount,
+	})
+	if err != nil {
+		t.Fatalf("build staging index: %v", err)
+	}
+	return index
+}
+
+func mapStagingRelease(
+	ctx context.Context,
+	index *gomodmap.StagingIndex,
+	git *gitcli.Runner,
+	mainline *gomodmap.SourceMainline,
+	previous, current, version string,
+) (gomodmap.CommitMapping, error) {
+	return index.MapRelease(ctx, git, mainline, gomodmap.StagingReleaseMappingOptions{
+		Previous: previous, Current: current, PreviousVersion: version,
+	})
+}
+
+func TestStagingIndex_MapReleaseMetadataCarry(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	source := newSourceFixture(ctx, t)
+	mainline, err := gomodmap.NewSourceMainline(ctx, source.repo.Git, gomodmap.MainlineOptions{
+		Revision: source.sha(t, "s4"), Anchor: source.sha(t, "s1"),
+	})
+	if err != nil {
+		t.Fatalf("build source mainline: %v", err)
+	}
+
+	const previousGoMod = "module k8s.io/api\n\ngo 1.26.0\n\nrequire example.com/dependency v1.0.0\n"
+	tests := []struct {
+		name        string
+		previous    string
+		path        string
+		contents    string
+		wantCarried bool
+	}{
+		{
+			name: "requirement upgrade and replacement",
+			path: "go.mod",
+			contents: "module k8s.io/api\n\ngo 1.26.0\n\nrequire example.com/dependency v1.1.0\n\n" +
+				"replace example.com/dependency => ../dependency\n",
+			wantCarried: true,
+		},
+		{
+			name:     "flattened staging placeholder",
+			previous: "module k8s.io/api\n\ngo 1.26.0\n\nrequire k8s.io/apimachinery v0.36.2\n",
+			path:     "go.mod",
+			contents: "module k8s.io/api\n\ngo 1.26.0\n\nrequire k8s.io/apimachinery v0.0.0\n\n" +
+				"replace k8s.io/apimachinery => ../apimachinery\n",
+			wantCarried: true,
+		},
+		{
+			name:     "requirement downgrade",
+			path:     "go.mod",
+			contents: "module k8s.io/api\n\ngo 1.26.0\n\nrequire example.com/dependency v0.9.0\n",
+		},
+		{
+			name:     "requirement removal",
+			path:     "go.mod",
+			contents: "module k8s.io/api\n\ngo 1.26.0\n",
+		},
+		{name: "package source", path: "types.go", contents: "package api\n"},
+		{
+			name:     "module language semantics",
+			path:     "go.mod",
+			contents: "module k8s.io/api\n\ngo 1.27.0\n\nrequire example.com/dependency v1.1.0\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo, base := newStagingTopology(ctx, t)
+			prior := test.previous
+			if prior == "" {
+				prior = previousGoMod
+			}
+			anchor := writeStagingFileCommit(
+				ctx, t, repo, base, "go.mod", prior,
+				claim("publish previous source", source.sha(t, "s1")),
+			)
+			previous := writeStagingCommit(ctx, t, repo, []string{anchor}, "previous dependency update\n")
+			current := writeStagingFileCommit(
+				ctx, t, repo, anchor, test.path, test.contents,
+				claim("publish current source", source.sha(t, "s4")),
+			)
+			index := stagingReleaseIndex(ctx, t, repo, previous, current, 0)
+			mapping, err := mapStagingRelease(ctx, index, repo.Git, mainline, previous, current, "v0.36.2")
+			if err != nil {
+				t.Fatalf("map release: %v", err)
+			}
+			if mapping.Carried != test.wantCarried {
+				t.Fatalf("mapping carried = %t, want %t: %#v", mapping.Carried, test.wantCarried, mapping)
+			}
+			if test.wantCarried {
+				if mapping.Staging != previous || mapping.Version != "v0.36.2" {
+					t.Fatalf("carried mapping = %#v", mapping)
+				}
+			} else if mapping.Staging != current || mapping.Version != "" {
+				t.Fatalf("source-changing mapping = %#v, want current commit", mapping)
+			}
+		})
+	}
 }
 
 func TestStagingIndex_Map(t *testing.T) {

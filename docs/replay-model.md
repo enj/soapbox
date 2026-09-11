@@ -240,8 +240,22 @@ All other topologies are refused:
 - A current-tag ancestry that does not reach the base through first-parent
   links.
 
-There is no lineage union and no fallback. A refused topology is fatal for the
-release that requires it; earlier accepted releases are unaffected.
+There is no lineage union and no arbitrary oldest-commit fallback. Intermediate
+mapping first looks for a staging claim on the bounded source mainline. The exact
+previous release target may be carried forward only when its package source and
+module-level semantics are unchanged: either the complete post-anchor delta has
+no source claims and the current tree passes that proof, or the matched staging
+commit passes it. For that equivalence proof, requirements may only be added or
+raised, except for a canonical staging placeholder paired with its exact sibling
+replacement; removals and downgrades prevent carry-forward. Replacements and
+`go.sum` may differ, while directives such as `module`, `go`, `toolchain`, and
+`godebug` must stay identical. The generated root flattens requirements, and its
+module-verification pass rejects any retained requirement that raises a resolved
+pin under minimal version selection. A mapped commit that fails equivalence stays
+pinned to its own version. A claim-free delta that fails equivalence, a delta
+whose claims map no bounded source ancestor, or a sampled walk is refused. A
+refused topology is fatal for the release that requires it; earlier accepted
+releases are unaffected.
 
 A legacy state record whose immutable anchor is the first patch release can only
 prove that release's minor line. Discovery therefore ignores later minor tags

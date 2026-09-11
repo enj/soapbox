@@ -210,6 +210,27 @@ func TestResolveCommitVersions_Rejects(t *testing.T) {
 			wantErr:  "has no mapped commit",
 		},
 		{
+			name: "carried mapping has invalid version",
+			mappings: []gomodmap.CommitMapping{{
+				ModulePath: "k8s.io/api", Source: sourceA, Staging: stagingA, Version: "latest", Carried: true,
+			}},
+			wantErr: "carried version",
+		},
+		{
+			name: "carried mapping has no version",
+			mappings: []gomodmap.CommitMapping{{
+				ModulePath: "k8s.io/api", Source: sourceA, Staging: stagingA, Carried: true,
+			}},
+			wantErr: "carried without an exact previous version",
+		},
+		{
+			name: "ordinary mapping has a carried version",
+			mappings: []gomodmap.CommitMapping{{
+				ModulePath: "k8s.io/api", Source: sourceA, Staging: stagingA, Version: "v0.36.2",
+			}},
+			wantErr: "without a carried mapping",
+		},
+		{
 			// The returned versions carry no source of their own, so a set drawn
 			// from two source commits would be cached under whichever one the
 			// caller happened to record it against.
@@ -385,6 +406,22 @@ func TestResolveCommitVersions_Real(t *testing.T) {
 		if resolved != want[i] {
 			t.Errorf("versions[%d] = %v, want %v", i, resolved, want[i])
 		}
+	}
+}
+
+func TestResolveCommitVersions_RealCarriedTag(t *testing.T) {
+	t.Parallel()
+
+	versions, err := gomodmap.ResolveCommitVersions(t.Context(), networkRunner(t), []gomodmap.CommitMapping{{
+		ModulePath: modModule, Source: sourceA, Staging: modTagCommit,
+		Version: modTagVersion, Carried: true,
+	}})
+	if err != nil {
+		t.Fatalf("resolve carried version: %v", err)
+	}
+	want := gomodmap.ModuleVersion{Path: modModule, Version: modTagVersion, Commit: modTagCommit}
+	if len(versions) != 1 || versions[0] != want {
+		t.Fatalf("carried versions = %v, want [%v]", versions, want)
 	}
 }
 

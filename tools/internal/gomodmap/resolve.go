@@ -96,9 +96,12 @@ func assertNamesTag(resolved gocli.Module, tag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ref := origin.Ref
-	if !strings.HasPrefix(ref, tagRefPrefix) || (ref != tagRefPrefix+tag && !strings.HasSuffix(ref, "/"+tag)) {
-		return "", fmt.Errorf("%w: %s %s was resolved through %q rather than a %s%s tag", ErrVersionMismatch, resolved.Path, resolved.Version, ref, tagRefPrefix, tag)
+	ref := tagRefPrefix + tag
+	if origin.VCS != "git" || origin.Subdir != "" || origin.Ref != ref {
+		return "", fmt.Errorf(
+			"%w: %s %s was resolved through VCS %q, subdirectory %q, and ref %q rather than root Git tag %s",
+			ErrVersionMismatch, resolved.Path, resolved.Version, origin.VCS, origin.Subdir, origin.Ref, ref,
+		)
 	}
 	return origin.Hash, nil
 }
@@ -106,12 +109,12 @@ func assertNamesTag(resolved gocli.Module, tag string) (string, error) {
 // ResolveCommitVersions pins the staging modules of an intermediate source
 // commit.
 //
-// Between releases there is no tag to read, so each module is asked for by the
-// staging commit it was mapped onto and the go command answers with the
-// pseudo-version that names it. The version is never assembled here even though
-// the format is public and stable, because a hand built version that is merely
-// well formed resolves to whatever the proxy already holds under that name, and
-// nothing about the result would reveal that it describes different code.
+// Between releases a module is normally asked for by the staging commit it was
+// mapped onto and the go command answers with the version that names it. When an
+// adjacent-release mapping proves the previous tag package-equivalent, it instead
+// asks for that exact tag and proves the tag still names the carried commit.
+// Versions are never assembled here: every answer and origin
+// comes from the Go command and is checked against the mapped object.
 //
 // The answer is then checked against the commit it was supposed to describe,
 // both through the revision the version itself encodes and through the version
@@ -152,8 +155,21 @@ func ResolveCommitVersions(ctx context.Context, runner *gocli.Runner, mappings [
 		if mapping.Staging == "" {
 			return nil, fmt.Errorf("staging versions: module %s has no mapped commit", mapping.ModulePath)
 		}
+		if mapping.Carried && mapping.Version == "" {
+			return nil, fmt.Errorf("staging versions: module %s is carried without an exact previous version", mapping.ModulePath)
+		}
+		if !mapping.Carried && mapping.Version != "" {
+			return nil, fmt.Errorf("staging versions: module %s has carried version %s without a carried mapping", mapping.ModulePath, mapping.Version)
+		}
+		query := mapping.Staging
+		if mapping.Version != "" {
+			if err := ValidateExactVersion(mapping.Version); err != nil {
+				return nil, fmt.Errorf("staging versions: module %s carried version: %w", mapping.ModulePath, err)
+			}
+			query = mapping.Version
+		}
 		paths[i] = mapping.ModulePath
-		queries[i] = mapping.ModulePath + "@" + mapping.Staging
+		queries[i] = mapping.ModulePath + "@" + query
 	}
 
 	resolved, err := resolveQueries(ctx, runner, paths, queries)
@@ -164,8 +180,21 @@ func ResolveCommitVersions(ctx context.Context, runner *gocli.Runner, mappings [
 	versions := make([]ModuleVersion, len(ordered))
 	for i, mapping := range ordered {
 		found := resolved[mapping.ModulePath]
-		if err := assertNamesCommit(found, mapping.Staging); err != nil {
-			return nil, fmt.Errorf("staging versions: module %s at %s: %w", mapping.ModulePath, mapping.Staging, err)
+		if mapping.Version == "" {
+			if err := assertNamesCommit(found, mapping.Staging); err != nil {
+				return nil, fmt.Errorf("staging versions: module %s at %s: %w", mapping.ModulePath, mapping.Staging, err)
+			}
+		} else {
+			if found.Version != mapping.Version {
+				return nil, fmt.Errorf("staging versions: %w: %s@%s resolved to %s", ErrVersionMismatch, mapping.ModulePath, mapping.Version, found.Version)
+			}
+			commit, err := assertNamesTag(found, mapping.Version)
+			if err != nil {
+				return nil, fmt.Errorf("staging versions: module %s at %s: %w", mapping.ModulePath, mapping.Version, err)
+			}
+			if commit != mapping.Staging {
+				return nil, fmt.Errorf("staging versions: %w: %s@%s resolves to %s, mapped commit is %s", ErrVersionMismatch, mapping.ModulePath, mapping.Version, commit, mapping.Staging)
+			}
 		}
 		versions[i] = ModuleVersion{
 			Path:    mapping.ModulePath,

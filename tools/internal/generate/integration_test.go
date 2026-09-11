@@ -91,6 +91,9 @@ func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToE
 
 	sources := make(map[string]generate.StagingSource, len(modulePaths))
 	commits := make(map[string]string, len(modulePaths))
+	previousCommits := make(map[string]string, len(modulePaths))
+	currentFiles := make(map[string]map[string]string, len(modulePaths))
+	previousFiles := make(map[string]map[string]string, len(modulePaths))
 	pseudos := make(map[string]string, len(modulePaths))
 	for _, modulePath := range modulePaths {
 		repo := testsupport.NewRepo(ctx, t, testsupport.Options{
@@ -99,8 +102,26 @@ func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToE
 			UserEmail: "k8s-publishing-bot@users.noreply.github.com",
 		})
 		repo.SetConfig(ctx, t, "uploadpack.allowFilter", "true")
-		base := repo.WriteAndCommit(ctx, t, "published.txt", modulePath+"\n",
-			"publish staging module\n\n"+gomodmap.KubernetesCommitTrailer+": "+e.upstream.commit+"\n")
+		files := maps.Clone(proxyModules[modulePath])
+		if stagingTag == fixtureStagingTag && modulePath == stagingComponentHelpers {
+			files["go.mod"] = strings.ReplaceAll(files["go.mod"], fixtureStagingTag, pseudos[stagingAPI]) +
+				"\nreplace " + stagingAPI + " => ../api\n"
+		}
+		fileNames := make([]string, 0, len(files))
+		for name, contents := range files {
+			repo.WriteFile(t, name, contents)
+			fileNames = append(fileNames, name)
+		}
+		slices.Sort(fileNames)
+		claimSource := e.upstream.commit
+		if stagingTag != fixtureStagingTag && modulePath == stagingAPIServer {
+			claimSource = strings.Repeat("f", 40)
+		}
+		base := repo.Commit(
+			ctx, t,
+			"publish staging module\n\n"+gomodmap.KubernetesCommitTrailer+": "+claimSource+"\n",
+			gitcli.CommitOptions{}, fileNames...,
+		)
 		tagger := gitcli.Signature{
 			Name:  "Kubernetes Publishing Bot",
 			Email: "k8s-publishing-bot@users.noreply.github.com",
@@ -109,7 +130,9 @@ func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToE
 		commitSignature := tagger
 		commitSignature.Date = "1767323045 +0000"
 		commit := base
-		if stagingTag != fixtureStagingTag {
+		previousCommit := base
+		previousFiles[modulePath] = maps.Clone(files)
+		if stagingTag != fixtureStagingTag && modulePath != stagingAPIServer {
 			tree, err := repo.Git.ResolveTree(ctx, base)
 			if err != nil {
 				t.Fatalf("resolve staging module %s tree: %v", modulePath, err)
@@ -121,19 +144,38 @@ func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToE
 			if err != nil {
 				t.Fatalf("write staging module %s previous tag spur: %v", modulePath, err)
 			}
-			commit, err = repo.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
-				Tree: tree, Parents: []string{base},
-				Message: "publish current staging module\n\n" + gomodmap.KubernetesCommitTrailer + ": " + e.upstream.commit + "\n",
-				Author:  commitSignature, Committer: commitSignature,
-			})
-			if err != nil {
-				t.Fatalf("write staging module %s current lineage: %v", modulePath, err)
+			if modulePath == stagingComponentHelpers {
+				files["go.mod"] = strings.ReplaceAll(files["go.mod"], fixtureStagingTag, gomodmap.StagingVersion) +
+					"\nreplace " + stagingAPI + " => ../api\n"
+				repo.WriteFile(t, "go.mod", files["go.mod"])
+				commit = repo.Commit(
+					ctx, t,
+					"publish current staging module\n\n"+gomodmap.KubernetesCommitTrailer+": "+e.upstream.commit+"\n",
+					gitcli.CommitOptions{}, "go.mod",
+				)
+			} else {
+				commit, err = repo.Git.WriteCommit(ctx, gitcli.CommitTreeOptions{
+					Tree: tree, Parents: []string{base},
+					Message: "publish current staging module\n\n" + gomodmap.KubernetesCommitTrailer + ": " + e.upstream.commit + "\n",
+					Author:  commitSignature, Committer: commitSignature,
+				})
+				if err != nil {
+					t.Fatalf("write staging module %s current lineage: %v", modulePath, err)
+				}
 			}
+			previousCommit = oldTarget
 			if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
 				Name: fixtureStagingTag, Commit: oldTarget,
 				Message: "staging " + fixtureStagingTag + "\n", Tagger: tagger,
 			}); err != nil {
 				t.Fatalf("tag staging module %s anchor: %v", modulePath, err)
+			}
+		} else if stagingTag != fixtureStagingTag {
+			if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
+				Name: fixtureStagingTag, Commit: base,
+				Message: "staging " + fixtureStagingTag + "\n", Tagger: tagger,
+			}); err != nil {
+				t.Fatalf("tag unchanged staging module %s anchor: %v", modulePath, err)
 			}
 		}
 		if err := repo.Git.CreateTag(ctx, gitcli.TagOptions{
@@ -142,24 +184,19 @@ func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToE
 			t.Fatalf("tag staging module %s: %v", modulePath, err)
 		}
 		commits[modulePath] = commit
+		previousCommits[modulePath] = previousCommit
+		currentFiles[modulePath] = maps.Clone(files)
 		pseudos[modulePath] = "v0.0.0-20260102030405-" + commit[:12]
 		sources[modulePath] = generate.StagingSource{Remote: "file://" + repo.Dir}
 	}
 
 	for _, modulePath := range modulePaths {
-		files := make(map[string]string, len(proxyModules[modulePath]))
-		for name, contents := range proxyModules[modulePath] {
-			files[name] = contents
-		}
-		// The real intermediate component-helpers module depends on the API
-		// pseudo-version from the same publication wave. Keep the fixture coherent
-		// so minimal version selection proves the pins rather than raising one.
-		if modulePath == stagingComponentHelpers {
-			files["go.mod"] = strings.ReplaceAll(files["go.mod"], fixtureStagingTag, pseudos[stagingAPI])
+		if stagingTag != fixtureStagingTag {
+			writeProxyModule(t, e.proxy, modulePath, fixtureStagingTag, previousCommits[modulePath], previousFiles[modulePath])
 		}
 		commit := commits[modulePath]
 		pseudo := pseudos[modulePath]
-		writeProxyModule(t, e.proxy, modulePath, pseudo, commit, files)
+		writeProxyModule(t, e.proxy, modulePath, pseudo, commit, currentFiles[modulePath])
 		versionDir := filepath.Join(e.proxy, filepath.FromSlash(modulePath), "@v")
 		info, err := os.ReadFile(filepath.Join(versionDir, pseudo+".info"))
 		if err != nil {
@@ -168,6 +205,12 @@ func addIntermediateStagingFixtures(ctx context.Context, t *testing.T, e *endToE
 		if err := os.WriteFile(filepath.Join(versionDir, commit+".info"), info, 0o600); err != nil {
 			t.Fatalf("write commit query info for %s: %v", modulePath, err)
 		}
+	}
+	if stagingTag != fixtureStagingTag {
+		// The adjacent-release fixture replaces the bootstrap tag records with
+		// records bound to these Git objects. A new runner gives that simulated
+		// later process a fresh module cache instead of stale bootstrap metadata.
+		e.opts.Go = fixtureGoWithModuleCache(t, e.proxy, filepath.Join(t.TempDir(), "module-cache"))
 	}
 	return sources
 }
@@ -200,6 +243,11 @@ func (e *endToEnd) relayout(ctx context.Context, t *testing.T) *endToEnd {
 // cache for reliability.
 func fixtureGo(t *testing.T, proxy string) *gocli.Runner {
 	t.Helper()
+	return fixtureGoWithModuleCache(t, proxy, moduleCache(t))
+}
+
+func fixtureGoWithModuleCache(t *testing.T, proxy, modCache string) *gocli.Runner {
+	t.Helper()
 	home := filepath.Join(t.TempDir(), "home")
 	if err := os.MkdirAll(filepath.Join(home, ".config", "go", "telemetry"), 0o750); err != nil {
 		t.Fatalf("isolated home: %v", err)
@@ -211,7 +259,7 @@ func fixtureGo(t *testing.T, proxy string) *gocli.Runner {
 		t.Fatalf("isolated home telemetry: %v", err)
 	}
 
-	isolation := []string{"HOME=" + home, "GOMODCACHE=" + moduleCache(t), "GOPATH=" + filepath.Join(home, "go")}
+	isolation := []string{"HOME=" + home, "GOMODCACHE=" + modCache, "GOPATH=" + filepath.Join(home, "go")}
 	// The build cache is carried over from the process rather than isolated,
 	// which is what every other package in this repository that drives the go
 	// command does. It is keyed by content, so it cannot serve one fixture's
@@ -948,6 +996,62 @@ func TestGenerateExactCommitResolvesIntermediateStagingHistory(t *testing.T) {
 	}
 	if len(entry.Modules) != len(result.Report.Staging.Modules) {
 		t.Errorf("intermediate index records %d modules, report has %d", len(entry.Modules), len(result.Report.Staging.Modules))
+	}
+}
+
+func TestGenerateExactCommitCarriesAdjacentStagingMetadata(t *testing.T) {
+	ctx := t.Context()
+	e := newEndToEnd(ctx, t, func(cfg *config.Config) {
+		cfg.Dependencies.Policy = config.DependencyPolicyExternal
+		cfg.Dependencies.CopyPackages = nil
+		cfg.Dependencies.ForbiddenModules = nil
+		cfg.Dependencies.Overrides = nil
+	})
+	e.opts.Materialize = false
+	e.generateOnce(ctx, t)
+
+	const rbacPath = "plugin/pkg/auth/authorizer/rbac/rbac.go"
+	e.upstream.repo.WriteFile(t, rbacPath, upstreamRBAC+"\n// AdjacentRelease changes watched source.\n")
+	intermediate := e.upstream.repo.Commit(ctx, t, "update rbac\n", gitcli.CommitOptions{}, rbacPath)
+	final := e.upstream.repo.WriteAndCommit(ctx, t, "docs/next.md", "next release\n", "prepare next release\n")
+	const nextSourceTag = "v1.36.2"
+	const nextModuleTag = "v0.36.2"
+	if err := e.upstream.repo.Git.CreateTag(ctx, gitcli.TagOptions{
+		Name: nextSourceTag, Commit: final, Message: "Kubernetes " + nextSourceTag + "\n",
+		Tagger: gitcli.Signature{Name: "Fixture Author", Email: "fixture@example.test", Date: "2026-02-02T03:04:05Z"},
+	}); err != nil {
+		t.Fatalf("tag next source release: %v", err)
+	}
+	cache, err := source.Open(ctx, source.Options{
+		Remote: e.upstream.url(), CacheRoot: e.roots.cache,
+		WorktreeRoot: filepath.Join(e.roots.work, "adjacent-source-worktrees"), Git: e.opts.Git,
+	})
+	if err != nil {
+		t.Fatalf("open source cache: %v", err)
+	}
+	if err := cache.Fetch(ctx, source.Refs{Tags: []string{nextSourceTag}}); err != nil {
+		t.Fatalf("fetch next source release: %v", err)
+	}
+
+	e.opts.StorePath = e.roots.store + ".adjacent-intermediate"
+	e.opts.Ref = extract.Ref{Kind: extract.RefCommit, Name: intermediate}
+	e.opts.ReleaseContext = nextSourceTag
+	e.opts.HistoryAnchor = e.upstream.commit
+	e.opts.HistoryAnchorRelease = fixtureTag
+	e.opts.StagingSources = addIntermediateStagingFixtures(ctx, t, e, nextModuleTag)
+	e.opts.Fetch = false
+	result := e.generateOnce(ctx, t)
+
+	if len(result.Report.Staging.Modules) != len(e.opts.StagingSources) {
+		t.Fatalf("resolved %d staging modules, want %d", len(result.Report.Staging.Modules), len(e.opts.StagingSources))
+	}
+	for _, pinned := range result.Report.Staging.Modules {
+		if pinned.Version != fixtureStagingTag {
+			t.Errorf("staging module %s version = %q, want carried %s", pinned.Path, pinned.Version, fixtureStagingTag)
+		}
+		if pinned.Commit == "" {
+			t.Errorf("staging module %s records no carried commit", pinned.Path)
+		}
 	}
 }
 

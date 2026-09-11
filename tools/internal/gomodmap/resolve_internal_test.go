@@ -158,6 +158,7 @@ func TestAssertNamesCommit(t *testing.T) {
 func TestAssertNamesTag(t *testing.T) {
 	t.Parallel()
 
+	const wantOriginErr = "rather than root Git tag refs/tags/v0.36.1"
 	tests := []struct {
 		name    string
 		origin  *gocli.ModuleOrigin
@@ -168,34 +169,39 @@ func TestAssertNamesTag(t *testing.T) {
 			origin: &gocli.ModuleOrigin{VCS: "git", Hash: commitA, Ref: "refs/tags/v0.36.1"},
 		},
 		{
-			// A module published from a subdirectory carries a tag prefix ahead
-			// of the version.
-			name:   "resolved through a prefixed release tag",
-			origin: &gocli.ModuleOrigin{VCS: "git", Hash: commitA, Ref: "refs/tags/staging/v0.36.1"},
+			name:    "resolved through a prefixed release tag",
+			origin:  &gocli.ModuleOrigin{VCS: "git", Hash: commitA, Ref: "refs/tags/staging/v0.36.1"},
+			wantErr: wantOriginErr,
 		},
 		{
-			// A moved tag or a stale proxy record can report the requested
-			// version while having resolved it through something else.
 			name:    "resolved through a branch",
 			origin:  &gocli.ModuleOrigin{VCS: "git", Hash: commitA, Ref: "refs/heads/release-1.36"},
-			wantErr: "rather than a refs/tags/v0.36.1 tag",
+			wantErr: wantOriginErr,
 		},
 		{
 			name:    "resolved through another tag",
 			origin:  &gocli.ModuleOrigin{VCS: "git", Hash: commitA, Ref: "refs/tags/v0.36.2"},
-			wantErr: "rather than a refs/tags/v0.36.1 tag",
+			wantErr: wantOriginErr,
+		},
+		{
+			name:    "resolved from a module subdirectory",
+			origin:  &gocli.ModuleOrigin{VCS: "git", Hash: commitA, Subdir: "staging", Ref: "refs/tags/v0.36.1"},
+			wantErr: wantOriginErr,
+		},
+		{
+			name:    "resolved from another VCS",
+			origin:  &gocli.ModuleOrigin{VCS: "hg", Hash: commitA, Ref: "refs/tags/v0.36.1"},
+			wantErr: wantOriginErr,
 		},
 		{
 			name:    "no reference at all",
 			origin:  &gocli.ModuleOrigin{VCS: "git", Hash: commitA},
-			wantErr: "rather than a refs/tags/v0.36.1 tag",
+			wantErr: wantOriginErr,
 		},
 		{
-			// A bare tag name is not a reference. Accepting it would let a value
-			// that never came from refs/tags/ satisfy the check by suffix alone.
 			name:    "reference is not under refs/tags",
 			origin:  &gocli.ModuleOrigin{VCS: "git", Hash: commitA, Ref: "v0.36.1"},
-			wantErr: "rather than a refs/tags/v0.36.1 tag",
+			wantErr: wantOriginErr,
 		},
 		{
 			name:    "no origin",
@@ -212,8 +218,6 @@ func TestAssertNamesTag(t *testing.T) {
 				if err != nil {
 					t.Fatalf("assert names tag: %v", err)
 				}
-				// The commit a tag resolved to is the evidence a later run has that
-				// the tag still names what it named before.
 				if commit != commitA {
 					t.Errorf("assert names tag returned commit %q, want %q", commit, commitA)
 				}

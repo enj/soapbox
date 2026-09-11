@@ -261,23 +261,38 @@ func (r *run) resolveIntermediateStaging(ctx context.Context, root *gomodmap.Roo
 			byTag[revision.Name] = revision
 		}
 		stagingGit := cache.Git().WithNoLazyFetch()
+		previous, current := byTag[stagingAnchorTag].Commit, byTag[stagingTag].Commit
 		anchor, err := gomodmap.StagingReleaseAnchor(ctx, stagingGit, gomodmap.StagingReleaseAnchorOptions{
 			ModulePath: modulePath,
-			Previous:   byTag[stagingAnchorTag].Commit,
-			Current:    byTag[stagingTag].Commit,
+			Previous:   previous,
+			Current:    current,
 		})
 		if err != nil {
 			return nil, err
 		}
-		index, err := gomodmap.NewStagingIndex(ctx, stagingGit, gomodmap.IndexOptions{
+		indexOptions := gomodmap.IndexOptions{
 			ModulePath: modulePath,
-			Revision:   byTag[stagingTag].Commit,
+			Revision:   current,
 			Anchor:     anchor,
-		})
+		}
+		if stagingAnchorTag != stagingTag {
+			indexOptions.Previous = previous
+		}
+		index, err := gomodmap.NewStagingIndex(ctx, stagingGit, indexOptions)
 		if err != nil {
 			return nil, err
 		}
-		mapping, err := index.Map(mainline)
+		var mapping gomodmap.CommitMapping
+		if stagingAnchorTag == stagingTag {
+			mapping, err = index.Map(mainline)
+		} else {
+			mapping, err = index.MapRelease(ctx, cache.Git(), mainline, gomodmap.StagingReleaseMappingOptions{
+				Previous:        previous,
+				Current:         current,
+				PreviousVersion: stagingAnchorTag,
+				AllowLazyFetch:  !r.opts.Offline,
+			})
+		}
 		if err != nil {
 			return nil, err
 		}
