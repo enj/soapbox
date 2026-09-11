@@ -15,20 +15,25 @@ import (
 // mainline, which is the repository an attacker would like a source command to
 // reach instead of the configured one.
 //
-// It is a copy rather than an unrelated repository on purpose: its history fast
-// forwards the cache, so a redirected fetch succeeds and the cache silently
+// It is a clone rather than an unrelated repository on purpose: its history
+// fast forwards the cache, so a redirected fetch succeeds and the cache silently
 // adopts the attacker's commit. An unrelated history would be refused by the
 // non fast forward rule and would prove only that some other safeguard caught
-// it.
+// it. Cloning also keeps this fixture at the same real Git boundary as the code
+// under test instead of depending on filesystem-copy directory enumeration.
 func evilUpstream(t *testing.T, up *upstream) (dir, commit string) {
 	t.Helper()
 	ctx := t.Context()
 
-	dir = filepath.Join(t.TempDir(), "attacker")
-	if err := os.CopyFS(dir, os.DirFS(up.repo.Dir)); err != nil {
-		t.Fatalf("copy upstream: %v", err)
+	root := t.TempDir()
+	dir = filepath.Join(root, "attacker")
+	runner := newAnonymousRunner(t, root)
+	if err := runner.CloneSource(ctx, gitcli.SourceCloneOptions{
+		Remote: up.url(), Directory: dir,
+	}); err != nil {
+		t.Fatalf("clone attacker upstream: %v", err)
 	}
-	git, err := newAnonymousRunner(t, dir).WithDir(dir)
+	git, err := runner.WithDir(dir)
 	if err != nil {
 		t.Fatalf("scope runner to the attacker repository: %v", err)
 	}
