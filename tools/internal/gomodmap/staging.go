@@ -7,10 +7,11 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/enj/soapbox/tools/internal/gitcli"
-	"github.com/enj/soapbox/tools/internal/gitgraph"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
+
+	"github.com/enj/soapbox/tools/internal/gitcli"
+	"github.com/enj/soapbox/tools/internal/gitgraph"
 )
 
 // KubernetesCommitTrailer is the trailer every published staging commit carries
